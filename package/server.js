@@ -190,6 +190,16 @@ function clientTests() {
 // Daemon mode: run tests on-demand via HTTP instead of at startup
 let daemonTestsRunning = false;
 
+// Reset all test states so they can be re-run
+function resetTestStates(suite) {
+  suite.tests.forEach((test) => {
+    test.state = undefined;
+    test.pending = false;
+    test.timedOut = false;
+  });
+  suite.suites.forEach(resetTestStates);
+}
+
 function runDaemonTests(grepPattern, invert, res) {
   if (daemonTestsRunning) {
     res.write('data: {"error": "Tests already running"}\n\n');
@@ -198,6 +208,9 @@ function runDaemonTests(grepPattern, invert, res) {
   }
 
   daemonTestsRunning = true;
+
+  // Reset test states so previously-run tests can run again
+  resetTestStates(mochaInstance.suite);
 
   // Set grep pattern for this run
   if (grepPattern) {
