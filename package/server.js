@@ -9,6 +9,72 @@ import fs from 'fs';
 import setArgs from './runtimeArgs';
 import handleCoverage from './server.handleCoverage';
 
+// File-to-suite tracking: capture source file for each describe() call
+// This must happen BEFORE test files are loaded (at module scope)
+const suiteToFile = new WeakMap();
+
+/**
+ * Normalize a file path to be relative to project root
+ * Strips leading slashes and ensures forward slashes
+ */
+function normalizePath(filepath) {
+  if (!filepath) return filepath;
+  // Remove leading slash if present
+  let normalized = filepath.replace(/^\/+/, '');
+  // Ensure forward slashes (Windows compat)
+  normalized = normalized.replace(/\\/g, '/');
+  return normalized;
+}
+
+function getCallerFile() {
+  const stack = new Error().stack || '';
+
+  // Match any test file pattern in any folder:
+  // - imports/.../foo.app-spec.ts
+  // - server/.../foo.app-test.ts
+  // - tests/foo.spec.ts
+  // Stack format: "at module (imports/api/foo.app-spec.js:11:1)"
+  // Capture: path between ( and : that ends with test pattern
+  const moduleMatch = stack.match(/\(([^)\s]+\.(app-spec|app-test|spec|test)\.[tj]s):/);
+  if (moduleMatch) {
+    return normalizePath(moduleMatch[1]);
+  }
+
+  return undefined;
+}
+
+// Wrap global describe to capture file info
+if (typeof global.describe === 'function') {
+  const originalDescribe = global.describe;
+
+  global.describe = function(title, fn) {
+    const suite = originalDescribe(title, fn);
+    if (suite && !suiteToFile.has(suite)) {
+      const file = getCallerFile();
+      if (file) {
+        suiteToFile.set(suite, file);
+        suite.file = file; // Also set on suite for easier access
+      }
+    }
+    return suite;
+  };
+
+  // Preserve describe.only and describe.skip
+  global.describe.only = function(title, fn) {
+    const suite = originalDescribe.only(title, fn);
+    if (suite && !suiteToFile.has(suite)) {
+      const file = getCallerFile();
+      if (file) {
+        suiteToFile.set(suite, file);
+        suite.file = file;
+      }
+    }
+    return suite;
+  };
+
+  global.describe.skip = originalDescribe.skip;
+}
+
 // Daemon mode: allow multiple test runs without recreating the Mocha instance
 const isDaemonMode = !!process.env.TEST_DAEMON;
 if (isDaemonMode) {
@@ -283,6 +349,61 @@ function runDaemonTests(grepPattern, invert, res) {
   });
 }
 
+/**
+ * Escape special regex characters in a string
+ */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Build a map of file paths to suite titles
+ */
+function buildFileMap() {
+  const fileMap = {};
+
+  function walkSuites(suite, parentFile) {
+    const file = suite.file || parentFile;
+    if (file && suite.title) {
+      if (!fileMap[file]) {
+        fileMap[file] = [];
+      }
+      fileMap[file].push(suite.fullTitle());
+    }
+    if (suite.suites) {
+      suite.suites.forEach(child => walkSuites(child, file));
+    }
+  }
+
+  walkSuites(mochaInstance.suite, undefined);
+  return fileMap;
+}
+
+/**
+ * Find all suite titles that match a file pattern
+ * Both input pattern and stored paths are normalized for consistent matching
+ */
+function findSuitesForFile(filePattern) {
+  const normalizedPattern = normalizePath(filePattern);
+  const fileSuites = [];
+
+  function findSuites(suite, parentFile) {
+    const file = suite.file || parentFile;
+    if (file) {
+      const normalizedFile = normalizePath(file);
+      if (normalizedFile.includes(normalizedPattern) && suite.title) {
+        fileSuites.push(escapeRegex(suite.fullTitle()));
+      }
+    }
+    if (suite.suites) {
+      suite.suites.forEach(child => findSuites(child, file));
+    }
+  }
+
+  findSuites(mochaInstance.suite, undefined);
+  return fileSuites;
+}
+
 function setupDaemonEndpoints() {
   // Health check endpoint
   WebApp.connectHandlers.use('/test/health', (req, res) => {
@@ -295,11 +416,19 @@ function setupDaemonEndpoints() {
     }));
   });
 
+  // File-to-suite mapping endpoint
+  WebApp.connectHandlers.use('/test/files', (req, res) => {
+    const fileMap = buildFileMap();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(fileMap, null, 2));
+  });
+
   // Run tests endpoint (SSE streaming)
   WebApp.connectHandlers.use('/test/run', (req, res) => {
     // Parse query params
     const url = new URL(req.url, `http://${req.headers.host}`);
     const grepPattern = url.searchParams.get('grep') || '';
+    const filePattern = url.searchParams.get('file') || '';
     const invert = url.searchParams.get('invert') === '1';
 
     res.writeHead(200, {
@@ -308,15 +437,45 @@ function setupDaemonEndpoints() {
       'Connection': 'keep-alive',
     });
 
-    res.write(`data: ${JSON.stringify({ type: 'start', grep: grepPattern || 'all tests', invert })}\n\n`);
+    // If file specified, convert to grep pattern
+    let effectiveGrep = grepPattern;
+    let description = grepPattern || 'all tests';
 
-    runDaemonTests(grepPattern, invert, res);
+    if (filePattern) {
+      const fileSuites = findSuitesForFile(filePattern);
+
+      if (fileSuites.length === 0) {
+        res.write(`data: ${JSON.stringify({ type: 'error', data: `No tests found for file: ${filePattern}` })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'done', failures: 1 })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Build regex that matches any of the suite titles
+      const fileGrep = `^(${fileSuites.join('|')})`;
+
+      // Combine with existing grep if present
+      if (grepPattern) {
+        effectiveGrep = `(?=${fileGrep})(?=.*${grepPattern})`;
+      } else {
+        effectiveGrep = fileGrep;
+      }
+
+      // Use filename for description
+      const filename = filePattern.split('/').pop();
+      description = grepPattern ? `${filename} (${grepPattern})` : filename;
+    }
+
+    res.write(`data: ${JSON.stringify({ type: 'start', grep: description, invert })}\n\n`);
+
+    runDaemonTests(effectiveGrep, invert, res);
   });
 
   console.log('\n========================================');
   console.log('  TEST DAEMON READY');
   console.log('  Health: http://localhost:9100/test/health');
-  console.log('  Run:    ./scripts/test-run [grep]');
+  console.log('  Files:  http://localhost:9100/test/files');
+  console.log('  Run:    ./scripts/test-run [grep|file]');
   console.log('========================================\n');
 }
 

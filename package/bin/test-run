@@ -343,7 +343,32 @@ async function handleDaemonCommand(cmd) {
 // Parse args
 const args = process.argv.slice(2)
 const testNamePatterns = []
+let filePattern = ''
 let invert = false
+
+/**
+ * Check if an argument looks like a test file path
+ * Supports: .app-spec., .app-test., .spec., .test.
+ */
+function isFilePath(arg) {
+  return arg.includes('.app-spec.') ||
+         arg.includes('.app-test.') ||
+         arg.includes('.spec.') ||
+         arg.includes('.test.')
+}
+
+/**
+ * Normalize a file path to be relative to project root
+ * Strips leading slashes and ensures forward slashes
+ */
+function normalizePath(filepath) {
+  if (!filepath) return filepath
+  // Remove leading slash if present
+  let normalized = filepath.replace(/^\/+/, '')
+  // Ensure forward slashes (Windows compat)
+  normalized = normalized.replace(/\\/g, '/')
+  return normalized
+}
 
 // Check for daemon commands first
 if (args[0] === 'daemon') {
@@ -357,6 +382,10 @@ if (args[0] === 'daemon') {
     if (arg === '-t' || arg === '--testNamePattern' || arg === '--grep' || arg === '-g') {
       if (args[i + 1]) testNamePatterns.push(args[++i])
     }
+    // File pattern (-f, --file)
+    else if (arg === '-f' || arg === '--file') {
+      if (args[i + 1]) filePattern = normalizePath(args[++i])
+    }
     // Invert
     else if (arg === '--invert' || arg === '-i') {
       invert = true
@@ -364,12 +393,13 @@ if (args[0] === 'daemon') {
     // Help
     else if (arg === '--help' || arg === '-h') {
       console.log(`
-Usage: test-run [options] [pattern...]
+Usage: test-run [options] [pattern|filepath...]
        test-run daemon [start|stop|status|restart]
 
 Options:
   -t, --testNamePattern <pattern>  Filter by test name (can repeat)
   -g, --grep <pattern>             Alias for -t
+  -f, --file <path>                Run tests in specific file
   -i, --invert                     Invert pattern match
   -h, --help                       Show this help
 
@@ -380,20 +410,28 @@ Daemon Commands:
   daemon restart   Restart the daemon
 
 Multiple patterns use OR logic.
+File paths are auto-detected (*.app-spec.ts, *.spec.ts).
 The daemon auto-starts if not running when tests are requested.
 
 Examples:
-  test-run                           Run all tests
-  test-run Calendar                  Tests matching "Calendar"
-  test-run -t Calendar -t sync       Tests matching "Calendar" OR "sync"
-  test-run Calendar -i               Exclude tests matching "Calendar"
-  test-run daemon stop               Stop the daemon
+  test-run                                      Run all tests
+  test-run Calendar                             Tests matching "Calendar"
+  test-run -t Calendar -t sync                  Tests matching "Calendar" OR "sync"
+  test-run Calendar -i                          Exclude tests matching "Calendar"
+  test-run imports/api/calendar/FullSync.app-spec.ts   Run specific file
+  test-run -f FullSync.app-spec.ts              Run file by partial path
+  test-run FullSync.app-spec.ts -t "clears"     File + grep filter
+  test-run daemon stop                          Stop the daemon
 `)
       process.exit(0)
     }
-    // Positional args become test name patterns
+    // Positional args: detect if file path or grep pattern
     else if (!arg.startsWith('-')) {
-      testNamePatterns.push(arg)
+      if (isFilePath(arg)) {
+        filePattern = normalizePath(arg)
+      } else {
+        testNamePatterns.push(arg)
+      }
     }
   }
 
@@ -418,14 +456,23 @@ async function runTests() {
 
   const params = new URLSearchParams()
   if (grep) params.set('grep', grep)
+  if (filePattern) params.set('file', filePattern)
   if (invert) params.set('invert', '1')
 
   const url = `http://localhost:${port}/test/run?${params}`
 
   // Build description
-  const desc = testNamePatterns.length > 0
-    ? testNamePatterns.join('|')
-    : 'all tests'
+  let desc
+  if (filePattern) {
+    const filename = path.basename(filePattern)
+    desc = testNamePatterns.length > 0
+      ? `${filename} (${testNamePatterns.join('|')})`
+      : filename
+  } else {
+    desc = testNamePatterns.length > 0
+      ? testNamePatterns.join('|')
+      : 'all tests'
+  }
   console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
 
   let exitCode = 0
