@@ -404,8 +404,42 @@ function buildFileMap() {
 }
 
 /**
+ * Check if pattern matches file path using whole path element matching.
+ * Pattern segments must match complete path segments in the file.
+ * e.g., "abc" matches "abc/def/file.ts" but not "abcd/file.ts"
+ * e.g., "abc/def" matches "abc/def/file.ts" but not "abc/defg/file.ts"
+ */
+function pathMatchesPattern(filePath, pattern) {
+  // Remove trailing slashes and split into segments
+  const fileSegments = filePath.replace(/\/+$/, '').split('/');
+  const patternSegments = pattern.replace(/\/+$/, '').split('/');
+
+  // Pattern must have fewer or equal segments to match
+  if (patternSegments.length > fileSegments.length) {
+    return false;
+  }
+
+  // Look for pattern as a contiguous sequence anywhere in file path
+  for (let start = 0; start <= fileSegments.length - patternSegments.length; start++) {
+    let matches = true;
+    for (let i = 0; i < patternSegments.length; i++) {
+      if (fileSegments[start + i] !== patternSegments[i]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Find all suite titles that match a file pattern
  * Both input pattern and stored paths are normalized for consistent matching
+ * Pattern matching uses whole path elements (not substring)
  */
 function findSuitesForFile(filePattern) {
   const normalizedPattern = normalizePath(filePattern);
@@ -415,7 +449,7 @@ function findSuitesForFile(filePattern) {
     const file = suite.file || parentFile;
     if (file) {
       const normalizedFile = normalizePath(file);
-      if (normalizedFile.includes(normalizedPattern) && suite.title) {
+      if (pathMatchesPattern(normalizedFile, normalizedPattern) && suite.title) {
         fileSuites.push(escapeRegex(suite.fullTitle()));
       }
     }
