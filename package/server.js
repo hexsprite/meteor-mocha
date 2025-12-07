@@ -227,7 +227,7 @@ function runDaemonTests(grepPattern, invert, res) {
   if (grepPattern) {
     mochaInstance.grep(grepPattern);
   } else {
-    mochaInstance.grep(''); // Clear any previous grep
+    mochaInstance.grep(/.*/); // Match all tests
   }
 
   // Set invert flag
