@@ -3,6 +3,7 @@ import { mochaInstance } from 'meteor/meteortesting:mocha-core';
 import { startBrowser } from 'meteor/meteortesting:browser-tests';
 import { onMessage } from 'meteor/inter-process-messaging';
 import { WebApp } from 'meteor/webapp';
+import { MongoInternals } from 'meteor/mongo';
 
 import fs from 'node:fs';
 
@@ -34,6 +35,21 @@ function normalizePath(filepath) {
   // Ensure forward slashes (Windows compat)
   normalized = normalized.replace(/\\/g, '/');
   return normalized;
+}
+
+/**
+ * Reset all collections after test run to prevent inter-run pollution
+ * Generic approach using MongoInternals - no app-specific dependencies
+ */
+async function resetAllCollections() {
+  const db = MongoInternals.defaultRemoteCollectionDriver().mongo.db;
+  const collections = await db.listCollections().toArray();
+
+  for (const { name } of collections) {
+    // Skip system collections
+    if (name.startsWith('system.')) continue;
+    await db.collection(name).deleteMany({});
+  }
 }
 
 function getCallerFile() {
@@ -355,7 +371,14 @@ function runDaemonTests(grepPattern, invert, res) {
 
   printHeader('SERVER');
 
-  mochaInstance.run((failureCount) => {
+  mochaInstance.run(async (failureCount) => {
+    // Reset all collections after tests complete to prevent inter-run pollution
+    try {
+      await resetAllCollections();
+    } catch (e) {
+      console.error('[daemon] Failed to reset collections:', e.message);
+    }
+
     // Restore all output handlers
     process.stdout.write = originalStdoutWrite;
     process.stderr.write = originalStderrWrite;
