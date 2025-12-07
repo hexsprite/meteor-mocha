@@ -180,10 +180,7 @@ The daemon tracks which file each test suite comes from by wrapping `describe()`
 
 1. **Server tests only** - The daemon runs with `TEST_CLIENT=0`. Client-side tests (those in `client/` folders) are not available via the daemon because they require a browser.
 
-2. **Hot reload** - Code changes require daemon restart to take effect:
-   ```bash
-   ./scripts/test-run daemon restart
-   ```
+2. **Hot reload** - The daemon runs Meteor in watch mode, so code changes are picked up automatically. When you save a file, Meteor rebuilds and the daemon restarts with the new code. No manual restart needed.
 
 3. **Shared state** - Tests share the same Meteor/MongoDB instance. Use `resetDatabase()` in `beforeEach()` to ensure isolation.
 
