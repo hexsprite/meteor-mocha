@@ -251,34 +251,57 @@ function runDaemonTests(grepPattern, invert, res) {
     output: serverOutput,
   });
 
-  // Capture console output and stream via SSE
+  // Capture all output (console + process.stdout/stderr) and stream via SSE
+  // Mocha's reporter writes directly to process.stdout, not console.log
   const originalLog = console.log;
   const originalError = console.error;
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+  const sendLog = (data) => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'log', data })}\n\n`);
+    } catch (e) {
+      // Connection closed
+    }
+  };
+
+  const sendError = (data) => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', data })}\n\n`);
+    } catch (e) {
+      // Connection closed
+    }
+  };
+
+  process.stdout.write = (chunk, encoding, callback) => {
+    const str = chunk.toString();
+    sendLog(str.replace(/\n$/, '')); // Remove trailing newline
+    return originalStdoutWrite(chunk, encoding, callback);
+  };
+
+  process.stderr.write = (chunk, encoding, callback) => {
+    const str = chunk.toString();
+    sendError(str.replace(/\n$/, ''));
+    return originalStderrWrite(chunk, encoding, callback);
+  };
 
   console.log = (...args) => {
     const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
     originalLog.apply(console, args);
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'log', data: line })}\n\n`);
-    } catch (e) {
-      // Connection closed
-    }
   };
 
   console.error = (...args) => {
     const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
     originalError.apply(console, args);
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', data: line })}\n\n`);
-    } catch (e) {
-      // Connection closed
-    }
   };
 
   printHeader('SERVER');
 
   mochaInstance.run((failureCount) => {
-    // Restore console
+    // Restore all output handlers
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
     console.log = originalLog;
     console.error = originalError;
 
