@@ -214,16 +214,6 @@ function clientTests() {
 // Daemon mode: run tests on-demand via HTTP instead of at startup
 let daemonTestsRunning = false;
 
-// Reset all test states so they can be re-run
-function resetTestStates(suite) {
-  suite.tests.forEach((test) => {
-    test.state = undefined;
-    test.pending = false;
-    test.timedOut = false;
-  });
-  suite.suites.forEach(resetTestStates);
-}
-
 function runDaemonTests(grepPattern, invert, res) {
   if (daemonTestsRunning) {
     res.write('data: {"error": "Tests already running"}\n\n');
@@ -234,14 +224,14 @@ function runDaemonTests(grepPattern, invert, res) {
   daemonTestsRunning = true;
 
   // Reset test states so previously-run tests can run again
-  resetTestStates(mochaInstance.suite);
+  // Uses Mocha's built-in reset() which properly clears:
+  // - test state, pending, timedOut, err, _currentRetry
+  // - all hooks (beforeEach, afterEach, beforeAll, afterAll)
+  mochaInstance.suite.reset();
 
   // Set grep pattern for this run
-  if (grepPattern) {
-    mochaInstance.grep(grepPattern);
-  } else {
-    mochaInstance.grep(/.*/); // Match all tests
-  }
+  // Mocha.grep() converts string to RegExp internally
+  mochaInstance.grep(grepPattern || ''); // Empty string matches all
 
   // Set invert flag - Mocha's invert() takes no args, it just sets to true
   // So we need to set options.invert directly
