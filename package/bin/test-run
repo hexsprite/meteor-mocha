@@ -21,6 +21,7 @@ const path = require('path')
 const port = process.env.TEST_PORT || 9100
 const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
 const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
+const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
 
 // Colors
 const colors = {
@@ -83,6 +84,80 @@ function isProcessRunning(pid) {
   }
 }
 
+// Lock file management to prevent race conditions
+const LOCK_STALE_MS = 180000 // 3 minutes - lock is stale if older than this
+
+function acquireLock() {
+  const dir = path.dirname(lockFile)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+
+  // Check for existing lock
+  try {
+    const lockData = fs.readFileSync(lockFile, 'utf8')
+    const { timestamp, pid } = JSON.parse(lockData)
+    const age = Date.now() - timestamp
+
+    // Lock is stale if too old or process is dead
+    if (age < LOCK_STALE_MS && isProcessRunning(pid)) {
+      return false // Lock is held by another process
+    }
+    // Stale lock - we can take over
+    console.log(`${colors.dim}Cleaning up stale lock file${colors.reset}`)
+  } catch {
+    // No lock file or invalid - we can acquire
+  }
+
+  // Write our lock
+  fs.writeFileSync(lockFile, JSON.stringify({
+    timestamp: Date.now(),
+    pid: process.pid,
+  }))
+  return true
+}
+
+function releaseLock() {
+  try {
+    // Only release if we own the lock
+    const lockData = fs.readFileSync(lockFile, 'utf8')
+    const { pid } = JSON.parse(lockData)
+    if (pid === process.pid) {
+      fs.unlinkSync(lockFile)
+    }
+  } catch {
+    // Lock file doesn't exist or can't be read - that's fine
+  }
+}
+
+async function waitForLockOrDaemon() {
+  const startTime = Date.now()
+  const maxWait = 180000 // 3 minutes max wait
+
+  while (Date.now() - startTime < maxWait) {
+    // If daemon is now running, we're good
+    if (await isDaemonRunning()) {
+      return { ready: true }
+    }
+
+    // Try to acquire lock
+    if (acquireLock()) {
+      // Check one more time - daemon might have started while we waited
+      if (await isDaemonRunning()) {
+        releaseLock()
+        return { ready: true }
+      }
+      return { locked: true }
+    }
+
+    // Lock is held - wait and retry
+    process.stdout.write('.')
+    await new Promise(r => setTimeout(r, 2000))
+  }
+
+  return { timeout: true }
+}
+
 // Start daemon in background
 async function startDaemon() {
   // Check if already running
@@ -91,54 +166,76 @@ async function startDaemon() {
     return true
   }
 
-  // Check if stale PID file
-  const existingPid = readPid()
-  if (existingPid && !isProcessRunning(existingPid)) {
-    console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
-    removePid()
+  // Try to get lock or wait for another process to start daemon
+  console.log(`${colors.dim}Checking for other startup processes...${colors.reset}`)
+  const lockResult = await waitForLockOrDaemon()
+
+  if (lockResult.ready) {
+    console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
+    return true
   }
 
-  console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
-
-  // Ensure log directory exists
-  const logDir = path.dirname(logFile)
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true })
+  if (lockResult.timeout) {
+    console.error(`${colors.red}Timeout waiting for daemon startup${colors.reset}`)
+    return false
   }
 
-  // Start daemon in background
-  const out = fs.openSync(logFile, 'a')
-  const err = fs.openSync(logFile, 'a')
-
-  const child = spawn('npm', ['run', 'test:daemon'], {
-    detached: true,
-    stdio: ['ignore', out, err],
-    cwd: process.cwd(),
-  })
-
-  writePid(child.pid)
-  child.unref()
-
-  console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
-  console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
-
-  // Wait for daemon to be ready
-  console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
-  const startTime = Date.now()
-  const timeout = 120000 // 2 minutes
-
-  while (Date.now() - startTime < timeout) {
-    if (await isDaemonRunning()) {
-      console.log(`${colors.green}Daemon ready!${colors.reset}\n`)
-      return true
+  // We have the lock - we're responsible for starting the daemon
+  try {
+    // Check if stale PID file
+    const existingPid = readPid()
+    if (existingPid && !isProcessRunning(existingPid)) {
+      console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
+      removePid()
     }
-    await new Promise(r => setTimeout(r, 2000))
-    process.stdout.write('.')
-  }
 
-  console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
-  console.error(`Check logs: ${logFile}`)
-  return false
+    console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
+
+    // Ensure log directory exists
+    const logDir = path.dirname(logFile)
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true })
+    }
+
+    // Start daemon in background
+    const out = fs.openSync(logFile, 'a')
+    const err = fs.openSync(logFile, 'a')
+
+    const child = spawn('npm', ['run', 'test:daemon'], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      cwd: process.cwd(),
+    })
+
+    writePid(child.pid)
+    child.unref()
+
+    console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
+    console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
+
+    // Wait for daemon to be ready
+    console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
+    const startTime = Date.now()
+    const timeout = 120000 // 2 minutes
+
+    while (Date.now() - startTime < timeout) {
+      if (await isDaemonRunning()) {
+        console.log(`${colors.green}Daemon ready!${colors.reset}\n`)
+        releaseLock()
+        return true
+      }
+      await new Promise(r => setTimeout(r, 2000))
+      process.stdout.write('.')
+    }
+
+    console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
+    console.error(`Check logs: ${logFile}`)
+    releaseLock()
+    return false
+  } catch (err) {
+    releaseLock()
+    throw err
+  }
 }
 
 // Stop daemon
