@@ -4,74 +4,23 @@
  * CLI client for test daemon
  *
  * Usage:
- *   ./scripts/test-run                    # Run all tests
+ *   ./scripts/test-run                    # Run all tests (auto-starts daemon)
  *   ./scripts/test-run Calendar           # Filter by pattern
  *   ./scripts/test-run -t Calendar -t sync # Multiple patterns (OR)
  *   ./scripts/test-run Calendar -i        # Exclude pattern
+ *   ./scripts/test-run daemon start       # Start daemon explicitly
+ *   ./scripts/test-run daemon stop        # Stop daemon
+ *   ./scripts/test-run daemon status      # Check daemon status
  */
 
 const http = require('http')
-
-// Parse args
-const args = process.argv.slice(2)
-const testNamePatterns = []
-let invert = false
-
-for (let i = 0; i < args.length; i++) {
-  const arg = args[i]
-
-  // Test name patterns (-t, --testNamePattern, --grep, -g)
-  if (arg === '-t' || arg === '--testNamePattern' || arg === '--grep' || arg === '-g') {
-    if (args[i + 1]) testNamePatterns.push(args[++i])
-  }
-  // Invert
-  else if (arg === '--invert' || arg === '-i') {
-    invert = true
-  }
-  // Help
-  else if (arg === '--help' || arg === '-h') {
-    console.log(`
-Usage: test-run [options] [pattern...]
-
-Options:
-  -t, --testNamePattern <pattern>  Filter by test name (can repeat)
-  -g, --grep <pattern>             Alias for -t
-  -i, --invert                     Invert pattern match
-  -h, --help                       Show this help
-
-Multiple patterns use OR logic.
-
-Examples:
-  test-run                           Run all tests
-  test-run Calendar                  Tests matching "Calendar"
-  test-run -t Calendar -t sync       Tests matching "Calendar" OR "sync"
-  test-run Calendar -i               Exclude tests matching "Calendar"
-`)
-    process.exit(0)
-  }
-  // Positional args become test name patterns
-  else if (!arg.startsWith('-')) {
-    testNamePatterns.push(arg)
-  }
-}
-
-// Combine patterns with OR regex
-const grep = testNamePatterns.length > 0
-  ? testNamePatterns.map(p => `(${p})`).join('|')
-  : ''
+const { spawn, execSync } = require('child_process')
+const fs = require('fs')
+const path = require('path')
 
 const port = process.env.TEST_PORT || 9100
-const params = new URLSearchParams()
-if (grep) params.set('grep', grep)
-if (invert) params.set('invert', '1')
-
-const url = `http://localhost:${port}/test/run?${params}`
-
-// Build description
-const desc = testNamePatterns.length > 0
-  ? testNamePatterns.join('|')
-  : 'all tests'
-console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
+const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
+const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
 
 // Colors
 const colors = {
@@ -83,68 +32,362 @@ const colors = {
   reset: '\x1b[0m',
 }
 
-let exitCode = 0
+// Check if daemon is running
+function isDaemonRunning() {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${port}/test/health`, (res) => {
+      resolve(res.statusCode === 200)
+    })
+    req.on('error', () => resolve(false))
+    req.setTimeout(1000, () => {
+      req.destroy()
+      resolve(false)
+    })
+  })
+}
 
-function handleEvent(data) {
-  switch (data.type) {
-    case 'start':
-      console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
-      break
-
-    case 'log':
-      // Raw console output from Mocha (already has ANSI colors)
-      console.log(data.data)
-      break
-
-    case 'error':
-      console.error(data.data)
-      break
-
-    case 'done':
-      exitCode = data.failures > 0 ? 1 : 0
-      console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
-      break
+// Read PID from file
+function readPid() {
+  try {
+    return parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10)
+  } catch {
+    return null
   }
 }
 
-// Make request
-const req = http.get(url, (res) => {
-  if (res.statusCode !== 200) {
-    console.error(`Error: Server returned ${res.statusCode}`)
-    console.error('Is the test daemon running? Start with: npm run test:daemon')
-    process.exit(1)
+// Write PID to file
+function writePid(pid) {
+  const dir = path.dirname(pidFile)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+  fs.writeFileSync(pidFile, String(pid))
+}
+
+// Remove PID file
+function removePid() {
+  try {
+    fs.unlinkSync(pidFile)
+  } catch {
+    // Ignore if doesn't exist
+  }
+}
+
+// Check if process is running
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Start daemon in background
+async function startDaemon() {
+  // Check if already running
+  if (await isDaemonRunning()) {
+    console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
+    return true
   }
 
-  let buffer = ''
+  // Check if stale PID file
+  const existingPid = readPid()
+  if (existingPid && !isProcessRunning(existingPid)) {
+    console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
+    removePid()
+  }
 
-  res.on('data', (chunk) => {
-    buffer += chunk
-    const lines = buffer.split('\n\n')
-    buffer = lines.pop() || '' // Keep incomplete chunk
+  console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
 
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        try {
-          const data = JSON.parse(line.slice(6))
-          handleEvent(data)
-        } catch (e) {
-          // Ignore parse errors
-        }
+  // Ensure log directory exists
+  const logDir = path.dirname(logFile)
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true })
+  }
+
+  // Start daemon in background
+  const out = fs.openSync(logFile, 'a')
+  const err = fs.openSync(logFile, 'a')
+
+  const child = spawn('npm', ['run', 'test:daemon'], {
+    detached: true,
+    stdio: ['ignore', out, err],
+    cwd: process.cwd(),
+  })
+
+  writePid(child.pid)
+  child.unref()
+
+  console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
+  console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
+
+  // Wait for daemon to be ready
+  console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
+  const startTime = Date.now()
+  const timeout = 120000 // 2 minutes
+
+  while (Date.now() - startTime < timeout) {
+    if (await isDaemonRunning()) {
+      console.log(`${colors.green}Daemon ready!${colors.reset}\n`)
+      return true
+    }
+    await new Promise(r => setTimeout(r, 2000))
+    process.stdout.write('.')
+  }
+
+  console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
+  console.error(`Check logs: ${logFile}`)
+  return false
+}
+
+// Stop daemon
+async function stopDaemon() {
+  const pid = readPid()
+  if (pid && isProcessRunning(pid)) {
+    console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
+    try {
+      // Kill the process group to get all child processes
+      process.kill(-pid, 'SIGTERM')
+    } catch {
+      // Try killing just the process
+      try {
+        process.kill(pid, 'SIGTERM')
+      } catch {
+        // Process already dead
       }
     }
-  })
-
-  res.on('end', () => {
-    process.exit(exitCode)
-  })
-})
-
-req.on('error', (err) => {
-  if (err.code === 'ECONNREFUSED') {
-    console.error(`${colors.red}Error: Cannot connect to test daemon${colors.reset}`)
-    console.error('\nStart the daemon first:\n  npm run test:daemon\n')
+    removePid()
+    console.log(`${colors.green}Daemon stopped${colors.reset}`)
   } else {
-    console.error(`${colors.red}Error: ${err.message}${colors.reset}`)
+    // Try to find and kill by port
+    try {
+      const result = execSync(`lsof -ti:${port}`).toString().trim()
+      if (result) {
+        const pids = result.split('\n')
+        for (const p of pids) {
+          try {
+            process.kill(parseInt(p, 10), 'SIGTERM')
+            console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
+          } catch {
+            // Process already dead
+          }
+        }
+        removePid()
+        console.log(`${colors.green}Daemon stopped${colors.reset}`)
+      } else {
+        console.log(`${colors.dim}No daemon running${colors.reset}`)
+      }
+    } catch {
+      console.log(`${colors.dim}No daemon running${colors.reset}`)
+    }
   }
-  process.exit(1)
-})
+}
+
+// Show daemon status
+async function daemonStatus() {
+  const running = await isDaemonRunning()
+  const pid = readPid()
+
+  if (running) {
+    console.log(`${colors.green}Daemon is running on port ${port}${colors.reset}`)
+    if (pid) {
+      console.log(`${colors.dim}PID: ${pid}${colors.reset}`)
+    }
+    // Get health info
+    try {
+      const health = await new Promise((resolve, reject) => {
+        http.get(`http://localhost:${port}/test/health`, (res) => {
+          let data = ''
+          res.on('data', chunk => data += chunk)
+          res.on('end', () => resolve(JSON.parse(data)))
+        }).on('error', reject)
+      })
+      console.log(`${colors.dim}Suites: ${health.suites}${colors.reset}`)
+    } catch {
+      // Ignore
+    }
+  } else {
+    console.log(`${colors.red}Daemon is not running${colors.reset}`)
+    if (pid && isProcessRunning(pid)) {
+      console.log(`${colors.yellow}PID file exists (${pid}) but daemon not responding${colors.reset}`)
+    }
+  }
+}
+
+// Handle daemon commands
+async function handleDaemonCommand(cmd) {
+  switch (cmd) {
+    case 'start':
+      await startDaemon()
+      process.exit(0)
+      break
+    case 'stop':
+      await stopDaemon()
+      process.exit(0)
+      break
+    case 'status':
+      await daemonStatus()
+      process.exit(0)
+      break
+    case 'restart':
+      await stopDaemon()
+      await new Promise(r => setTimeout(r, 1000))
+      await startDaemon()
+      process.exit(0)
+      break
+    default:
+      console.error(`Unknown daemon command: ${cmd}`)
+      console.error('Usage: test-run daemon [start|stop|status|restart]')
+      process.exit(1)
+  }
+}
+
+// Parse args
+const args = process.argv.slice(2)
+const testNamePatterns = []
+let invert = false
+
+// Check for daemon commands first
+if (args[0] === 'daemon') {
+  handleDaemonCommand(args[1] || 'status')
+} else {
+  // Parse test args
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+
+    // Test name patterns (-t, --testNamePattern, --grep, -g)
+    if (arg === '-t' || arg === '--testNamePattern' || arg === '--grep' || arg === '-g') {
+      if (args[i + 1]) testNamePatterns.push(args[++i])
+    }
+    // Invert
+    else if (arg === '--invert' || arg === '-i') {
+      invert = true
+    }
+    // Help
+    else if (arg === '--help' || arg === '-h') {
+      console.log(`
+Usage: test-run [options] [pattern...]
+       test-run daemon [start|stop|status|restart]
+
+Options:
+  -t, --testNamePattern <pattern>  Filter by test name (can repeat)
+  -g, --grep <pattern>             Alias for -t
+  -i, --invert                     Invert pattern match
+  -h, --help                       Show this help
+
+Daemon Commands:
+  daemon start     Start the test daemon in background
+  daemon stop      Stop the running daemon
+  daemon status    Check if daemon is running
+  daemon restart   Restart the daemon
+
+Multiple patterns use OR logic.
+The daemon auto-starts if not running when tests are requested.
+
+Examples:
+  test-run                           Run all tests
+  test-run Calendar                  Tests matching "Calendar"
+  test-run -t Calendar -t sync       Tests matching "Calendar" OR "sync"
+  test-run Calendar -i               Exclude tests matching "Calendar"
+  test-run daemon stop               Stop the daemon
+`)
+      process.exit(0)
+    }
+    // Positional args become test name patterns
+    else if (!arg.startsWith('-')) {
+      testNamePatterns.push(arg)
+    }
+  }
+
+  // Run tests
+  runTests()
+}
+
+async function runTests() {
+  // Check if daemon is running, auto-start if not
+  if (!await isDaemonRunning()) {
+    console.log(`${colors.yellow}Daemon not running, starting...${colors.reset}\n`)
+    const started = await startDaemon()
+    if (!started) {
+      process.exit(1)
+    }
+  }
+
+  // Combine patterns with OR regex
+  const grep = testNamePatterns.length > 0
+    ? testNamePatterns.map(p => `(${p})`).join('|')
+    : ''
+
+  const params = new URLSearchParams()
+  if (grep) params.set('grep', grep)
+  if (invert) params.set('invert', '1')
+
+  const url = `http://localhost:${port}/test/run?${params}`
+
+  // Build description
+  const desc = testNamePatterns.length > 0
+    ? testNamePatterns.join('|')
+    : 'all tests'
+  console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
+
+  let exitCode = 0
+
+  function handleEvent(data) {
+    switch (data.type) {
+      case 'start':
+        console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
+        break
+
+      case 'log':
+        // Raw console output from Mocha (already has ANSI colors)
+        console.log(data.data)
+        break
+
+      case 'error':
+        console.error(data.data)
+        break
+
+      case 'done':
+        exitCode = data.failures > 0 ? 1 : 0
+        console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+        break
+    }
+  }
+
+  // Make request
+  const req = http.get(url, (res) => {
+    if (res.statusCode !== 200) {
+      console.error(`Error: Server returned ${res.statusCode}`)
+      process.exit(1)
+    }
+
+    let buffer = ''
+
+    res.on('data', (chunk) => {
+      buffer += chunk
+      const lines = buffer.split('\n\n')
+      buffer = lines.pop() || '' // Keep incomplete chunk
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6))
+            handleEvent(data)
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
+      }
+    })
+
+    res.on('end', () => {
+      process.exit(exitCode)
+    })
+  })
+
+  req.on('error', (err) => {
+    console.error(`${colors.red}Error: ${err.message}${colors.reset}`)
+    process.exit(1)
+  })
+}
