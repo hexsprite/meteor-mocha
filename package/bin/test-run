@@ -347,14 +347,16 @@ let filePattern = ''
 let invert = false
 
 /**
- * Check if an argument looks like a test file path
- * Supports: .app-spec., .app-test., .spec., .test.
+ * Check if an argument looks like a test file or directory path
+ * Supports: .app-spec., .app-test., .spec., .test., or paths ending with /
  */
 function isFilePath(arg) {
   return arg.includes('.app-spec.') ||
          arg.includes('.app-test.') ||
          arg.includes('.spec.') ||
-         arg.includes('.test.')
+         arg.includes('.test.') ||
+         arg.endsWith('/') ||
+         arg.includes('/') && !arg.includes('.')  // directory path like imports/api/calendar
 }
 
 /**
