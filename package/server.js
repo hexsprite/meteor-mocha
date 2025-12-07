@@ -2,6 +2,7 @@
 import { mochaInstance } from 'meteor/meteortesting:mocha-core';
 import { startBrowser } from 'meteor/meteortesting:browser-tests';
 import { onMessage } from 'meteor/inter-process-messaging';
+import { WebApp } from 'meteor/webapp';
 
 import fs from 'node:fs';
 
@@ -17,6 +18,13 @@ let clientReporter;
 let serverReporter;
 let serverOutput;
 let clientOutput;
+
+// Daemon mode: allow multiple test runs without recreating the Mocha instance
+const isDaemonMode = !!process.env.TEST_DAEMON;
+if (isDaemonMode) {
+  // Use Mocha's method API to set options properly
+  mochaInstance.cleanReferencesAfterRun(false);
+}
 
 if (Package['browser-policy-common'] && Package['browser-policy-content']) {
   const { BrowserPolicy } = Package['browser-policy-common'];
@@ -203,6 +211,112 @@ function clientTests() {
   });
 }
 
+// Daemon mode: run tests on-demand via HTTP instead of at startup
+let daemonTestsRunning = false;
+
+function runDaemonTests(grepPattern, invert, res) {
+  if (daemonTestsRunning) {
+    res.write('data: {"error": "Tests already running"}\n\n');
+    res.end();
+    return;
+  }
+
+  daemonTestsRunning = true;
+
+  // Set grep pattern for this run
+  if (grepPattern) {
+    mochaInstance.grep(grepPattern);
+  } else {
+    mochaInstance.grep(''); // Clear any previous grep
+  }
+
+  // Set invert flag
+  mochaInstance.invert(invert);
+
+  mochaInstance.color(true);
+  mochaInstance.reporter(serverReporter || reporter || 'spec', {
+    output: serverOutput,
+  });
+
+  // Capture console output and stream via SSE
+  const originalLog = console.log;
+  const originalError = console.error;
+
+  console.log = (...args) => {
+    const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    originalLog.apply(console, args);
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'log', data: line })}\n\n`);
+    } catch (e) {
+      // Connection closed
+    }
+  };
+
+  console.error = (...args) => {
+    const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+    originalError.apply(console, args);
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', data: line })}\n\n`);
+    } catch (e) {
+      // Connection closed
+    }
+  };
+
+  printHeader('SERVER');
+
+  mochaInstance.run((failureCount) => {
+    // Restore console
+    console.log = originalLog;
+    console.error = originalError;
+
+    daemonTestsRunning = false;
+
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount })}\n\n`);
+      res.end();
+    } catch (e) {
+      // Connection closed
+    }
+  });
+}
+
+function setupDaemonEndpoints() {
+  // Health check endpoint
+  WebApp.connectHandlers.use('/test/health', (req, res) => {
+    const suiteCount = mochaInstance.suite.suites.length;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ready',
+      suites: suiteCount,
+      running: daemonTestsRunning,
+    }));
+  });
+
+  // Run tests endpoint (SSE streaming)
+  WebApp.connectHandlers.use('/test/run', (req, res) => {
+    // Parse query params
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const grepPattern = url.searchParams.get('grep') || '';
+    const invert = url.searchParams.get('invert') === '1';
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    res.write(`data: ${JSON.stringify({ type: 'start', grep: grepPattern || 'all tests', invert })}\n\n`);
+
+    runDaemonTests(grepPattern, invert, res);
+  });
+
+  console.log('\n========================================');
+  console.log('  TEST DAEMON READY');
+  console.log('  Health: http://localhost:9100/test/health');
+  console.log('  Run:    ./scripts/test-run [grep]');
+  console.log('========================================\n');
+}
+
 // Before Meteor calls the `start` function, app tests will be parsed and loaded by Mocha
 function start() {
   const args = setArgs();
@@ -215,6 +329,12 @@ function start() {
   serverReporter = mochaOptions.serverReporter;
   serverOutput = mochaOptions.serverOutput;
   clientOutput = mochaOptions.clientOutput;
+
+  // In daemon mode, don't run tests at startup - wait for HTTP requests
+  if (isDaemonMode) {
+    setupDaemonEndpoints();
+    return;
+  }
 
   // Run in PARALLEL or SERIES
   // Running in series is a better default since it avoids db and state conflicts for newbs.
