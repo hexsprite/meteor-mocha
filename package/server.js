@@ -219,8 +219,9 @@ function runDaemonTests(grepPattern, invert, res) {
     mochaInstance.grep(/.*/); // Match all tests
   }
 
-  // Set invert flag
-  mochaInstance.invert(invert);
+  // Set invert flag - Mocha's invert() takes no args, it just sets to true
+  // So we need to set options.invert directly
+  mochaInstance.options.invert = invert;
 
   mochaInstance.color(true);
   mochaInstance.reporter(serverReporter || reporter || 'spec', {
