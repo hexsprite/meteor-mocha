@@ -382,7 +382,7 @@ async function startDaemon(quiet = false) {
     while (Date.now() - startTime < timeout) {
       if (await isDaemonRunning()) {
         if (tailer) tailer.stop()
-        if (!quiet) console.log(`\n${colors.green}Daemon ready!${colors.reset}\n`)
+        if (!quiet) console.log(`\n${colors.green}Daemon ready with latest code!${colors.reset}\n`)
         releaseLock()
         return true
       }
@@ -668,6 +668,7 @@ async function runTests() {
             invert: false,
             cached: true,
             cached_age_seconds: ageSeconds,
+            hint: 'Cached result. File changes are auto-detected - just re-run to get fresh results.',
             ...cached.jsonResult,
           }
           console.log(JSON.stringify(output, null, 2))
@@ -687,7 +688,7 @@ async function runTests() {
   // Check if daemon is running, auto-start if not
   if (!await isDaemonRunning()) {
     if (!jsonMode) {
-      console.log(`${colors.yellow}Daemon not running, starting...${colors.reset}\n`)
+      console.log(`${colors.yellow}Daemon not running, starting fresh (will load latest code)...${colors.reset}\n`)
     }
     const started = await startDaemon(jsonMode) // Pass quiet flag for JSON mode
     if (!started) {
@@ -786,6 +787,7 @@ async function runTests() {
             file: filePattern || null,
             invert: invert || false,
             duration_ms: duration,
+            hint: 'Fresh run. Results cached for 1 min unless source files change.',
             ...(jsonResult || {}),
           }
           console.log(JSON.stringify(output, null, 2))
