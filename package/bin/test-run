@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 /* eslint-disable no-console, max-len, complexity */
+
+// Suppress experimental warnings (e.g., fs.glob) to keep output clean
+process.removeAllListeners('warning')
 /**
  * CLI client for test daemon
  *
