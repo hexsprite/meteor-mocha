@@ -271,15 +271,26 @@ function clientTests() {
 
 // Daemon mode: run tests on-demand via HTTP instead of at startup
 let daemonTestsRunning = false;
+let clientDisconnected = false;
 
 function runDaemonTests(grepPattern, invert, res) {
   if (daemonTestsRunning) {
-    res.write('data: {"error": "Tests already running"}\n\n');
+    res.write(`data: ${JSON.stringify({ type: 'error', data: 'Tests already running - wait or restart daemon' })}\n\n`);
     res.end();
     return;
   }
 
   daemonTestsRunning = true;
+  clientDisconnected = false;
+
+  // Handle client disconnect - reset flag so new clients can run
+  res.on('close', () => {
+    if (daemonTestsRunning) {
+      console.log('[daemon] Client disconnected while tests running');
+      clientDisconnected = true;
+      // Note: Tests keep running but we track disconnect for cleanup
+    }
+  });
 
   // Reset test states so previously-run tests can run again
   // Uses Mocha's built-in reset() which properly clears:
@@ -374,11 +385,15 @@ function runDaemonTests(grepPattern, invert, res) {
 
     daemonTestsRunning = false;
 
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount })}\n\n`);
-      res.end();
-    } catch (e) {
-      // Connection closed
+    if (clientDisconnected) {
+      console.log(`[daemon] Tests completed (${failureCount} failures) but client already disconnected`);
+    } else {
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount })}\n\n`);
+        res.end();
+      } catch (e) {
+        // Connection closed
+      }
     }
   });
 }
