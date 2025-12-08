@@ -533,6 +533,7 @@ let invert = false
 let watchMode = false
 let jsonMode = false
 let snapshotUpdate = false
+let bail = false
 
 /**
  * Check if an argument looks like a test file or directory path
@@ -592,6 +593,10 @@ if (args[0] === 'daemon') {
     else if (arg === '--snapshot-update' || arg === '-u') {
       snapshotUpdate = true
     }
+    // Bail on first failure
+    else if (arg === '--bail' || arg === '-b') {
+      bail = true
+    }
     // Help
     else if (arg === '--help' || arg === '-h') {
       console.log(`
@@ -606,6 +611,7 @@ Options:
   -w, --watch                      Watch mode: re-run on daemon restart
   --json                           Output results as JSON (for LLM/scripting)
   -u, --snapshot-update            Update snapshots (sets SNAPSHOT_UPDATE=1)
+  -b, --bail                       Stop on first test failure
   --no-cache                       Force run, skip cache check
   -h, --help                       Show this help
 
@@ -713,6 +719,7 @@ async function runTests() {
   if (invert) params.set('invert', '1')
   if (jsonMode) params.set('reporter', 'json')
   if (snapshotUpdate) params.set('snapshotUpdate', '1')
+  if (bail) params.set('bail', '1')
 
   const url = `http://localhost:${port}/test/run?${params}`
 

@@ -336,6 +336,13 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
   // So we need to set options.invert directly
   mochaInstance.options.invert = invert;
 
+  // Set bail mode if requested (stop on first failure)
+  if (options.bail) {
+    mochaInstance.bail(true);
+  } else {
+    mochaInstance.bail(false); // Reset for next run
+  }
+
   // Use JSON reporter if requested, otherwise default to spec
   const useJsonReporter = options.reporter === 'json';
   mochaInstance.color(!useJsonReporter); // No ANSI colors in JSON mode
@@ -569,6 +576,7 @@ function setupDaemonEndpoints() {
     const invert = url.searchParams.get('invert') === '1';
     const reporter = url.searchParams.get('reporter') || 'spec';
     const snapshotUpdate = url.searchParams.get('snapshotUpdate') === '1';
+    const bail = url.searchParams.get('bail') === '1';
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -607,7 +615,7 @@ function setupDaemonEndpoints() {
 
     res.write(`data: ${JSON.stringify({ type: 'start', grep: description, invert })}\n\n`);
 
-    runDaemonTests(effectiveGrep, invert, res, { reporter, snapshotUpdate });
+    runDaemonTests(effectiveGrep, invert, res, { reporter, snapshotUpdate, bail });
   });
 
   console.log('\n========================================');
