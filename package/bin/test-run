@@ -532,6 +532,7 @@ let filePattern = ''
 let invert = false
 let watchMode = false
 let jsonMode = false
+let snapshotUpdate = false
 
 /**
  * Check if an argument looks like a test file or directory path
@@ -587,6 +588,10 @@ if (args[0] === 'daemon') {
     else if (arg === '--json') {
       jsonMode = true
     }
+    // Snapshot update mode
+    else if (arg === '--snapshot-update' || arg === '-u') {
+      snapshotUpdate = true
+    }
     // Help
     else if (arg === '--help' || arg === '-h') {
       console.log(`
@@ -600,6 +605,7 @@ Options:
   -i, --invert                     Invert pattern match
   -w, --watch                      Watch mode: re-run on daemon restart
   --json                           Output results as JSON (for LLM/scripting)
+  -u, --snapshot-update            Update snapshots (sets SNAPSHOT_UPDATE=1)
   --no-cache                       Force run, skip cache check
   -h, --help                       Show this help
 
@@ -706,6 +712,7 @@ async function runTests() {
   if (filePattern) params.set('file', filePattern)
   if (invert) params.set('invert', '1')
   if (jsonMode) params.set('reporter', 'json')
+  if (snapshotUpdate) params.set('snapshotUpdate', '1')
 
   const url = `http://localhost:${port}/test/run?${params}`
 
