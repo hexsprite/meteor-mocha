@@ -8,6 +8,8 @@
  *   ./scripts/test-run Calendar           # Filter by pattern
  *   ./scripts/test-run -t Calendar -t sync # Multiple patterns (OR)
  *   ./scripts/test-run Calendar -i        # Exclude pattern
+ *   ./scripts/test-run --json             # JSON output for LLM/scripting
+ *   ./scripts/test-run Calendar --json    # Filtered tests with JSON output
  *   ./scripts/test-run daemon start       # Start daemon explicitly
  *   ./scripts/test-run daemon stop        # Stop daemon
  *   ./scripts/test-run daemon status      # Check daemon status
@@ -250,7 +252,7 @@ async function checkCache() {
   const cache = readCache()
   if (!cache?.lastRun) return null
 
-  const { timestamp, projectMtime, output, exitCode, failures } = cache.lastRun
+  const { timestamp, projectMtime, output, exitCode, failures, jsonResult } = cache.lastRun
 
   // TTL check
   const age = Date.now() - timestamp
@@ -260,13 +262,13 @@ async function checkCache() {
   const currentMtime = await getProjectMtime()
   if (currentMtime > projectMtime) return null
 
-  return { output, exitCode, failures, age }
+  return { output, exitCode, failures, age, jsonResult }
 }
 
 /**
  * Save result to cache
  */
-async function saveCache(output, exitCode, failures) {
+async function saveCache(output, exitCode, failures, jsonResult = null) {
   const projectMtime = await getProjectMtime()
   writeCache({
     lastRun: {
@@ -275,6 +277,7 @@ async function saveCache(output, exitCode, failures) {
       output,
       exitCode,
       failures,
+      jsonResult, // Store structured JSON for --json mode
     }
   })
 }
@@ -308,19 +311,19 @@ async function waitForLockOrDaemon() {
 }
 
 // Start daemon in background
-async function startDaemon() {
+async function startDaemon(quiet = false) {
   // Check if already running
   if (await isDaemonRunning()) {
-    console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
+    if (!quiet) console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
     return true
   }
 
   // Try to get lock or wait for another process to start daemon
-  console.log(`${colors.dim}Checking for other startup processes...${colors.reset}`)
+  if (!quiet) console.log(`${colors.dim}Checking for other startup processes...${colors.reset}`)
   const lockResult = await waitForLockOrDaemon()
 
   if (lockResult.ready) {
-    console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
+    if (!quiet) console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
     return true
   }
 
@@ -334,11 +337,11 @@ async function startDaemon() {
     // Check if stale PID file
     const existingPid = readPid()
     if (existingPid && !isProcessRunning(existingPid)) {
-      console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
+      if (!quiet) console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
       removePid()
     }
 
-    console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
+    if (!quiet) console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
 
     // Ensure log directory exists
     const logDir = path.dirname(logFile)
@@ -359,29 +362,31 @@ async function startDaemon() {
     writePid(child.pid)
     child.unref()
 
-    console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
-    console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
+    if (!quiet) {
+      console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
+      console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
+    }
 
-    // Start tailing log file to show startup progress/errors
-    const tailer = tailLogFile()
-    tailer.start()
+    // Start tailing log file to show startup progress/errors (skip in quiet mode)
+    const tailer = quiet ? null : tailLogFile()
+    if (tailer) tailer.start()
 
     // Wait for daemon to be ready
-    console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
+    if (!quiet) console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
     const startTime = Date.now()
     const timeout = 120000 // 2 minutes
 
     while (Date.now() - startTime < timeout) {
       if (await isDaemonRunning()) {
-        tailer.stop()
-        console.log(`\n${colors.green}Daemon ready!${colors.reset}\n`)
+        if (tailer) tailer.stop()
+        if (!quiet) console.log(`\n${colors.green}Daemon ready!${colors.reset}\n`)
         releaseLock()
         return true
       }
       await new Promise(r => setTimeout(r, 2000))
     }
 
-    tailer.stop()
+    if (tailer) tailer.stop()
     console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
     console.error(`${colors.dim}See errors above or check: ${logFile}${colors.reset}`)
     releaseLock()
@@ -523,6 +528,7 @@ const testNamePatterns = []
 let filePattern = ''
 let invert = false
 let watchMode = false
+let jsonMode = false
 
 /**
  * Check if an argument looks like a test file or directory path
@@ -574,6 +580,10 @@ if (args[0] === 'daemon') {
     else if (arg === '--watch' || arg === '-w') {
       watchMode = true
     }
+    // JSON output mode
+    else if (arg === '--json') {
+      jsonMode = true
+    }
     // Help
     else if (arg === '--help' || arg === '-h') {
       console.log(`
@@ -586,6 +596,7 @@ Options:
   -f, --file <path>                Run tests in specific file
   -i, --invert                     Invert pattern match
   -w, --watch                      Watch mode: re-run on daemon restart
+  --json                           Output results as JSON (for LLM/scripting)
   --no-cache                       Force run, skip cache check
   -h, --help                       Show this help
 
@@ -609,6 +620,8 @@ Examples:
   test-run -f FullSync.app-spec.ts              Run file by partial path
   test-run FullSync.app-spec.ts -t "clears"     File + grep filter
   test-run Calendar -w                          Watch mode: re-run on changes
+  test-run --json                               JSON output for LLM consumption
+  test-run Calendar --json | jq '.stats'        Filter JSON with jq
   test-run daemon stop                          Stop the daemon
 `)
       process.exit(0)
@@ -629,6 +642,7 @@ Examples:
 
 async function runTests() {
   // Check cache for full test runs (no grep, no file filter, no invert)
+  // Cache checks file mtimes, so changed files will invalidate it automatically
   const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
   const noCache = args.includes('--no-cache')
 
@@ -636,17 +650,35 @@ async function runTests() {
     const cached = await checkCache()
     if (cached) {
       const ageSeconds = Math.round(cached.age / 1000)
-      console.log(`\n${colors.cyan}Using cached result (no files changed, ${ageSeconds}s ago)${colors.reset}\n`)
-      console.log(cached.output)
-      console.log(`${colors.dim}Test run complete: ${cached.failures} failures (cached)${colors.reset}\n`)
+
+      if (jsonMode) {
+        // Return cached JSON result
+        // For full runs (cached), grep/file/invert are always null/false
+        const output = {
+          success: cached.exitCode === 0,
+          grep: null,
+          file: null,
+          invert: false,
+          cached: true,
+          cached_age_seconds: ageSeconds,
+          ...(cached.jsonResult || {}),
+        }
+        console.log(JSON.stringify(output, null, 2))
+      } else {
+        console.log(`\n${colors.cyan}Using cached result (no files changed, ${ageSeconds}s ago)${colors.reset}\n`)
+        console.log(cached.output)
+        console.log(`${colors.dim}Test run complete: ${cached.failures} failures (cached)${colors.reset}\n`)
+      }
       process.exit(cached.exitCode)
     }
   }
 
   // Check if daemon is running, auto-start if not
   if (!await isDaemonRunning()) {
-    console.log(`${colors.yellow}Daemon not running, starting...${colors.reset}\n`)
-    const started = await startDaemon()
+    if (!jsonMode) {
+      console.log(`${colors.yellow}Daemon not running, starting...${colors.reset}\n`)
+    }
+    const started = await startDaemon(jsonMode) // Pass quiet flag for JSON mode
     if (!started) {
       process.exit(1)
     }
@@ -661,6 +693,7 @@ async function runTests() {
   if (grep) params.set('grep', grep)
   if (filePattern) params.set('file', filePattern)
   if (invert) params.set('invert', '1')
+  if (jsonMode) params.set('reporter', 'json')
 
   const url = `http://localhost:${port}/test/run?${params}`
 
@@ -676,44 +709,82 @@ async function runTests() {
       ? testNamePatterns.join('|')
       : 'all tests'
   }
-  console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
+  // Only show running message in non-JSON mode
+  if (!jsonMode) {
+    console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
+  }
 
   let exitCode = 0
   let outputBuffer = ''
   let failureCount = 0
   let cachePromise = null
   let retrying = false
+  let jsonResult = null // Parsed JSON from Mocha reporter
+  const startTime = Date.now()
 
   function handleEvent(data) {
     switch (data.type) {
       case 'start':
-        console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
+        if (!jsonMode) {
+          console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
+        }
         break
 
       case 'log':
         // Raw console output from Mocha (already has ANSI colors)
-        console.log(data.data)
+        if (!jsonMode) {
+          console.log(data.data)
+        }
         outputBuffer += data.data + '\n'
         break
 
       case 'error':
         if (data.data && data.data.includes('already running')) {
-          console.log(`${colors.yellow}Tests already running - waiting 5s to retry...${colors.reset}`)
+          if (!jsonMode) {
+            console.log(`${colors.yellow}Tests already running - waiting 5s to retry...${colors.reset}`)
+          }
           retrying = true
           setTimeout(() => runTests(), 5000)
           return // Don't continue processing
         }
-        console.error(data.data)
+        if (!jsonMode) {
+          console.error(data.data)
+        }
         outputBuffer += data.data + '\n'
+        break
+
+      case 'json':
+        // Mocha JSON reporter output
+        try {
+          jsonResult = JSON.parse(data.data)
+        } catch (e) {
+          jsonResult = { parseError: e.message, raw: data.data }
+        }
         break
 
       case 'done':
         exitCode = data.failures > 0 ? 1 : 0
         failureCount = data.failures
-        console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+
+        if (jsonMode) {
+          // Build final JSON output
+          const duration = Date.now() - startTime
+          const output = {
+            success: exitCode === 0,
+            grep: grep || null,
+            file: filePattern || null,
+            invert: invert || false,
+            duration_ms: duration,
+            ...(jsonResult || {}),
+          }
+          console.log(JSON.stringify(output, null, 2))
+        } else {
+          console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+        }
+
         // Save to cache for full runs (store promise to await later)
         if (isFullRun) {
-          cachePromise = saveCache(outputBuffer, exitCode, failureCount)
+          cachePromise = saveCache(outputBuffer, exitCode, failureCount, jsonResult)
         }
         break
 
@@ -734,8 +805,8 @@ async function runTests() {
     let lastActivity = Date.now()
     let inactivityWarnings = 0
 
-    // Warn if no output for 30 seconds (might be a hung test)
-    const inactivityCheck = setInterval(() => {
+    // Warn if no output for 30 seconds (might be a hung test) - skip in JSON mode
+    const inactivityCheck = jsonMode ? null : setInterval(() => {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
       if (elapsed >= 30) {
         inactivityWarnings++
@@ -765,7 +836,7 @@ async function runTests() {
     })
 
     res.on('end', async () => {
-      clearInterval(inactivityCheck)
+      if (inactivityCheck) clearInterval(inactivityCheck)
 
       // If retrying due to "already running", don't exit
       if (retrying) return

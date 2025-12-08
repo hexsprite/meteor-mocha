@@ -297,7 +297,7 @@ function clientTests() {
 let daemonTestsRunning = false;
 let clientDisconnected = false;
 
-function runDaemonTests(grepPattern, invert, res) {
+function runDaemonTests(grepPattern, invert, res, options = {}) {
   if (daemonTestsRunning) {
     res.write(`data: ${JSON.stringify({ type: 'error', data: 'Tests already running - wait or restart daemon' })}\n\n`);
     res.end();
@@ -330,8 +330,10 @@ function runDaemonTests(grepPattern, invert, res) {
   // So we need to set options.invert directly
   mochaInstance.options.invert = invert;
 
-  mochaInstance.color(true);
-  mochaInstance.reporter(serverReporter || reporter || 'spec', {
+  // Use JSON reporter if requested, otherwise default to spec
+  const useJsonReporter = options.reporter === 'json';
+  mochaInstance.color(!useJsonReporter); // No ANSI colors in JSON mode
+  mochaInstance.reporter(useJsonReporter ? 'json' : (serverReporter || reporter || 'spec'), {
     output: serverOutput,
   });
 
@@ -341,6 +343,9 @@ function runDaemonTests(grepPattern, invert, res) {
   const originalError = console.error;
   const originalStdoutWrite = process.stdout.write.bind(process.stdout);
   const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+  // Buffer for JSON reporter output (collected and sent at end)
+  let jsonBuffer = '';
 
   const sendLog = (data) => {
     try {
@@ -360,7 +365,12 @@ function runDaemonTests(grepPattern, invert, res) {
 
   process.stdout.write = (chunk, encoding, callback) => {
     const str = chunk.toString();
-    sendLog(str.replace(/\n$/, '')); // Remove trailing newline
+    if (useJsonReporter) {
+      // Collect JSON output instead of streaming
+      jsonBuffer += str;
+    } else {
+      sendLog(str.replace(/\n$/, '')); // Remove trailing newline
+    }
     return originalStdoutWrite(chunk, encoding, callback);
   };
 
@@ -380,7 +390,10 @@ function runDaemonTests(grepPattern, invert, res) {
     originalError.apply(console, args);
   };
 
-  printHeader('SERVER');
+  // Skip header in JSON mode to keep output clean
+  if (!useJsonReporter) {
+    printHeader('SERVER');
+  }
 
   // Send heartbeat every 10s so client knows we're alive even if tests produce no output
   const heartbeat = setInterval(() => {
@@ -413,6 +426,10 @@ function runDaemonTests(grepPattern, invert, res) {
       console.log(`[daemon] Tests completed (${failureCount} failures) but client already disconnected`);
     } else {
       try {
+        // Send JSON reporter output if using JSON mode
+        if (useJsonReporter && jsonBuffer) {
+          res.write(`data: ${JSON.stringify({ type: 'json', data: jsonBuffer.trim() })}\n\n`);
+        }
         res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount })}\n\n`);
         res.end();
       } catch (e) {
@@ -537,6 +554,7 @@ function setupDaemonEndpoints() {
     const grepPattern = url.searchParams.get('grep') || '';
     const filePattern = url.searchParams.get('file') || '';
     const invert = url.searchParams.get('invert') === '1';
+    const reporter = url.searchParams.get('reporter') || 'spec';
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -575,7 +593,7 @@ function setupDaemonEndpoints() {
 
     res.write(`data: ${JSON.stringify({ type: 'start', grep: description, invert })}\n\n`);
 
-    runDaemonTests(effectiveGrep, invert, res);
+    runDaemonTests(effectiveGrep, invert, res, { reporter });
   });
 
   console.log('\n========================================');
