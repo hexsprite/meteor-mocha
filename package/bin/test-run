@@ -140,6 +140,13 @@ function tailLogFile() {
   let lastSize = 0
 
   const startTailing = () => {
+    // Start from current file size so we only see NEW content
+    try {
+      lastSize = fs.statSync(logFile).size
+    } catch {
+      lastSize = 0 // File doesn't exist yet
+    }
+
     const checkFile = () => {
       try {
         const stat = fs.statSync(logFile)
