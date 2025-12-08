@@ -283,6 +283,12 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
   daemonTestsRunning = true;
   clientDisconnected = false;
 
+  // Set snapshot update mode if requested (for snapshot testing)
+  const previousSnapshotUpdate = process.env.SNAPSHOT_UPDATE;
+  if (options.snapshotUpdate) {
+    process.env.SNAPSHOT_UPDATE = '1';
+  }
+
   // Handle client disconnect - reset flag so new clients can run
   res.on('close', () => {
     if (daemonTestsRunning) {
@@ -395,6 +401,13 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     process.stderr.write = originalStderrWrite;
     console.log = originalLog;
     console.error = originalError;
+
+    // Restore SNAPSHOT_UPDATE env var
+    if (previousSnapshotUpdate !== undefined) {
+      process.env.SNAPSHOT_UPDATE = previousSnapshotUpdate;
+    } else {
+      delete process.env.SNAPSHOT_UPDATE;
+    }
 
     daemonTestsRunning = false;
 
@@ -531,6 +544,7 @@ function setupDaemonEndpoints() {
     const filePattern = url.searchParams.get('file') || '';
     const invert = url.searchParams.get('invert') === '1';
     const reporter = url.searchParams.get('reporter') || 'spec';
+    const snapshotUpdate = url.searchParams.get('snapshotUpdate') === '1';
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -569,7 +583,7 @@ function setupDaemonEndpoints() {
 
     res.write(`data: ${JSON.stringify({ type: 'start', grep: description, invert })}\n\n`);
 
-    runDaemonTests(effectiveGrep, invert, res, { reporter });
+    runDaemonTests(effectiveGrep, invert, res, { reporter, snapshotUpdate });
   });
 
   console.log('\n========================================');
