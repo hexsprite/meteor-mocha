@@ -43,6 +43,22 @@ const colors = {
   reset: '\x1b[0m',
 }
 
+/**
+ * Get recent lines from the daemon log file
+ * @param {number} numLines - Number of lines to return (default 20)
+ * @returns {string[]} Array of recent log lines, or empty array if no log file
+ */
+function getRecentLogs(numLines = 20) {
+  try {
+    if (!fs.existsSync(logFile)) return []
+    const content = fs.readFileSync(logFile, 'utf8')
+    const lines = content.split('\n').filter(l => l.trim())
+    return lines.slice(-numLines)
+  } catch {
+    return []
+  }
+}
+
 // Check if daemon is running
 function isDaemonRunning() {
   return new Promise((resolve) => {
@@ -839,6 +855,7 @@ async function runTests() {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
       if (elapsed >= HANG_THRESHOLD_SECONDS) {
         inactivityWarnings++
+        const recentLogs = getRecentLogs(15)
         if (jsonMode) {
           clearInterval(inactivityCheck)
           req.destroy()
@@ -846,9 +863,10 @@ async function runTests() {
             success: false,
             error: 'timeout',
             inactivity_seconds: elapsed,
-            hint: `No test output for ${elapsed}s (Mocha timeout is 2s). Test is hung. Check: ./scripts/test-run daemon logs -t`,
+            hint: `No test output for ${elapsed}s (Mocha timeout is 2s). Test is hung.`,
             grep: grep || null,
             file: filePattern || null,
+            recent_logs: recentLogs,
           }
           console.log(JSON.stringify(output, null, 2))
           process.exitCode = 1
@@ -856,6 +874,11 @@ async function runTests() {
           console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung (Mocha timeout is 2s)${colors.reset}`)
           if (inactivityWarnings >= 2) {
             console.log(`${colors.dim}  Tip: Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+          }
+          // Show recent logs on second warning
+          if (inactivityWarnings === 2 && recentLogs.length > 0) {
+            console.log(`\n${colors.dim}Recent daemon logs:${colors.reset}`)
+            recentLogs.forEach(line => console.log(`  ${colors.dim}${line}${colors.reset}`))
           }
         }
       }
