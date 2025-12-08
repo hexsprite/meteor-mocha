@@ -682,6 +682,7 @@ async function runTests() {
   let outputBuffer = ''
   let failureCount = 0
   let cachePromise = null
+  let retrying = false
 
   function handleEvent(data) {
     switch (data.type) {
@@ -696,6 +697,12 @@ async function runTests() {
         break
 
       case 'error':
+        if (data.data && data.data.includes('already running')) {
+          console.log(`${colors.yellow}Tests already running - waiting 5s to retry...${colors.reset}`)
+          retrying = true
+          setTimeout(() => runTests(), 5000)
+          return // Don't continue processing
+        }
         console.error(data.data)
         outputBuffer += data.data + '\n'
         break
@@ -759,6 +766,9 @@ async function runTests() {
 
     res.on('end', async () => {
       clearInterval(inactivityCheck)
+
+      // If retrying due to "already running", don't exit
+      if (retrying) return
 
       // Wait for cache to be saved before exiting
       if (cachePromise) {
