@@ -12,6 +12,7 @@
  *   ./scripts/test-run daemon stop        # Stop daemon
  *   ./scripts/test-run daemon status      # Check daemon status
  *   ./scripts/test-run daemon logs        # Show daemon logs
+ *   ./scripts/test-run Calendar -w       # Watch mode: re-run on file changes
  */
 
 const http = require('http')
@@ -506,6 +507,7 @@ const args = process.argv.slice(2)
 const testNamePatterns = []
 let filePattern = ''
 let invert = false
+let watchMode = false
 
 /**
  * Check if an argument looks like a test file or directory path
@@ -553,6 +555,10 @@ if (args[0] === 'daemon') {
     else if (arg === '--invert' || arg === '-i') {
       invert = true
     }
+    // Watch mode
+    else if (arg === '--watch' || arg === '-w') {
+      watchMode = true
+    }
     // Help
     else if (arg === '--help' || arg === '-h') {
       console.log(`
@@ -564,6 +570,7 @@ Options:
   -g, --grep <pattern>             Alias for -t
   -f, --file <path>                Run tests in specific file
   -i, --invert                     Invert pattern match
+  -w, --watch                      Watch mode: re-run on daemon restart
   --no-cache                       Force run, skip cache check
   -h, --help                       Show this help
 
@@ -586,6 +593,7 @@ Examples:
   test-run imports/api/calendar/FullSync.app-spec.ts   Run specific file
   test-run -f FullSync.app-spec.ts              Run file by partial path
   test-run FullSync.app-spec.ts -t "clears"     File + grep filter
+  test-run Calendar -w                          Watch mode: re-run on changes
   test-run daemon stop                          Stop the daemon
 `)
       process.exit(0)
@@ -720,12 +728,46 @@ async function runTests() {
       if (cachePromise) {
         await cachePromise.catch(() => {}) // Ignore cache errors
       }
-      process.exit(exitCode)
+
+      if (watchMode) {
+        // Watch mode: wait for daemon restart, then re-run
+        console.log(`${colors.cyan}Watching for changes... (Ctrl+C to exit)${colors.reset}`)
+        await waitForDaemonRestart()
+        runTests() // Re-run with same parameters
+      } else {
+        process.exit(exitCode)
+      }
     })
   })
 
-  req.on('error', (err) => {
-    console.error(`${colors.red}Error: ${err.message}${colors.reset}`)
-    process.exit(1)
+  req.on('error', async (err) => {
+    if (watchMode && err.code === 'ECONNREFUSED') {
+      // Daemon went down - wait for it to come back
+      console.log(`${colors.yellow}Daemon stopped, waiting for restart...${colors.reset}`)
+      await waitForDaemonRestart()
+      runTests()
+    } else {
+      console.error(`${colors.red}Error: ${err.message}${colors.reset}`)
+      process.exit(1)
+    }
   })
+}
+
+/**
+ * Wait for daemon to restart (go down then come back up)
+ */
+async function waitForDaemonRestart() {
+  // First wait for daemon to go down (if it's still up)
+  let wasDown = false
+  while (true) {
+    const running = await isDaemonRunning()
+    if (!running) {
+      wasDown = true
+    } else if (wasDown) {
+      // Daemon is back up
+      console.log(`\n${colors.green}Daemon restarted!${colors.reset}\n`)
+      return
+    }
+    await new Promise(r => setTimeout(r, 500))
+  }
 }
