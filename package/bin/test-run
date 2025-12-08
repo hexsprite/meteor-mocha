@@ -22,6 +22,8 @@ const port = process.env.TEST_PORT || 9100
 const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
 const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
 const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
+const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
+const CACHE_TTL_MS = 60000 // 1 minute
 
 // Colors
 const colors = {
@@ -130,6 +132,143 @@ function releaseLock() {
   }
 }
 
+/**
+ * Tail the daemon log file during startup to show errors in real-time
+ */
+function tailLogFile() {
+  let tail = null
+  let lastSize = 0
+
+  const startTailing = () => {
+    const checkFile = () => {
+      try {
+        const stat = fs.statSync(logFile)
+        if (stat.size > lastSize) {
+          const fd = fs.openSync(logFile, 'r')
+          const buffer = Buffer.alloc(stat.size - lastSize)
+          fs.readSync(fd, buffer, 0, buffer.length, lastSize)
+          fs.closeSync(fd)
+
+          const content = buffer.toString()
+          for (const line of content.split('\n')) {
+            if (line.trim()) {
+              // Color errors red, warnings yellow
+              if (line.includes('Error') || line.includes('error:')) {
+                console.log(`${colors.red}[daemon] ${line}${colors.reset}`)
+              } else if (line.includes('Warning') || line.includes('warning')) {
+                console.log(`${colors.yellow}[daemon] ${line}${colors.reset}`)
+              } else {
+                console.log(`${colors.dim}[daemon] ${line}${colors.reset}`)
+              }
+            }
+          }
+          lastSize = stat.size
+        }
+      } catch {
+        // File doesn't exist yet - that's fine
+      }
+    }
+
+    // Poll every 500ms
+    tail = setInterval(checkFile, 500)
+    checkFile() // Check immediately
+  }
+
+  const stopTailing = () => {
+    if (tail) {
+      clearInterval(tail)
+      tail = null
+    }
+  }
+
+  return { start: startTailing, stop: stopTailing }
+}
+
+/**
+ * Get latest mtime across all project files
+ */
+async function getProjectMtime() {
+  const patterns = [
+    'imports/**/*.{ts,tsx,js,jsx}',
+    'server/**/*.{ts,js}',
+    'client/**/*.{ts,tsx,js,jsx}',
+  ]
+
+  let latestMtime = 0
+
+  for (const pattern of patterns) {
+    const fullPattern = path.join(process.cwd(), pattern)
+    for await (const file of fs.promises.glob(fullPattern)) {
+      try {
+        const stat = fs.statSync(file)
+        if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs
+      } catch {
+        // File gone - ignore
+      }
+    }
+  }
+
+  return latestMtime
+}
+
+/**
+ * Read cache file
+ */
+function readCache() {
+  try {
+    return JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write cache file
+ */
+function writeCache(data) {
+  const dir = path.dirname(cacheFile)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+  fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2))
+}
+
+/**
+ * Check if we can use cached result
+ */
+async function checkCache() {
+  const cache = readCache()
+  if (!cache?.lastRun) return null
+
+  const { timestamp, projectMtime, output, exitCode, failures } = cache.lastRun
+
+  // TTL check
+  const age = Date.now() - timestamp
+  if (age > CACHE_TTL_MS) return null
+
+  // File change check
+  const currentMtime = await getProjectMtime()
+  if (currentMtime > projectMtime) return null
+
+  return { output, exitCode, failures, age }
+}
+
+/**
+ * Save result to cache
+ */
+async function saveCache(output, exitCode, failures) {
+  const projectMtime = await getProjectMtime()
+  writeCache({
+    lastRun: {
+      timestamp: Date.now(),
+      projectMtime,
+      output,
+      exitCode,
+      failures,
+    }
+  })
+}
+
 async function waitForLockOrDaemon() {
   const startTime = Date.now()
   const maxWait = 180000 // 3 minutes max wait
@@ -213,6 +352,10 @@ async function startDaemon() {
     console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
     console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
 
+    // Start tailing log file to show startup progress/errors
+    const tailer = tailLogFile()
+    tailer.start()
+
     // Wait for daemon to be ready
     console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
     const startTime = Date.now()
@@ -220,16 +363,17 @@ async function startDaemon() {
 
     while (Date.now() - startTime < timeout) {
       if (await isDaemonRunning()) {
-        console.log(`${colors.green}Daemon ready!${colors.reset}\n`)
+        tailer.stop()
+        console.log(`\n${colors.green}Daemon ready!${colors.reset}\n`)
         releaseLock()
         return true
       }
       await new Promise(r => setTimeout(r, 2000))
-      process.stdout.write('.')
     }
 
+    tailer.stop()
     console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
-    console.error(`Check logs: ${logFile}`)
+    console.error(`${colors.dim}See errors above or check: ${logFile}${colors.reset}`)
     releaseLock()
     return false
   } catch (err) {
@@ -403,6 +547,7 @@ Options:
   -g, --grep <pattern>             Alias for -t
   -f, --file <path>                Run tests in specific file
   -i, --invert                     Invert pattern match
+  --no-cache                       Force run, skip cache check
   -h, --help                       Show this help
 
 Daemon Commands:
@@ -442,6 +587,21 @@ Examples:
 }
 
 async function runTests() {
+  // Check cache for full test runs (no grep, no file filter, no invert)
+  const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
+  const noCache = args.includes('--no-cache')
+
+  if (isFullRun && !noCache) {
+    const cached = await checkCache()
+    if (cached) {
+      const ageSeconds = Math.round(cached.age / 1000)
+      console.log(`\n${colors.cyan}Using cached result (no files changed, ${ageSeconds}s ago)${colors.reset}\n`)
+      console.log(cached.output)
+      console.log(`${colors.dim}Test run complete: ${cached.failures} failures (cached)${colors.reset}\n`)
+      process.exit(cached.exitCode)
+    }
+  }
+
   // Check if daemon is running, auto-start if not
   if (!await isDaemonRunning()) {
     console.log(`${colors.yellow}Daemon not running, starting...${colors.reset}\n`)
@@ -478,6 +638,9 @@ async function runTests() {
   console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
 
   let exitCode = 0
+  let outputBuffer = ''
+  let failureCount = 0
+  let cachePromise = null
 
   function handleEvent(data) {
     switch (data.type) {
@@ -488,15 +651,22 @@ async function runTests() {
       case 'log':
         // Raw console output from Mocha (already has ANSI colors)
         console.log(data.data)
+        outputBuffer += data.data + '\n'
         break
 
       case 'error':
         console.error(data.data)
+        outputBuffer += data.data + '\n'
         break
 
       case 'done':
         exitCode = data.failures > 0 ? 1 : 0
+        failureCount = data.failures
         console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+        // Save to cache for full runs (store promise to await later)
+        if (isFullRun) {
+          cachePromise = saveCache(outputBuffer, exitCode, failureCount)
+        }
         break
     }
   }
@@ -527,7 +697,11 @@ async function runTests() {
       }
     })
 
-    res.on('end', () => {
+    res.on('end', async () => {
+      // Wait for cache to be saved before exiting
+      if (cachePromise) {
+        await cachePromise.catch(() => {}) // Ignore cache errors
+      }
       process.exit(exitCode)
     })
   })
