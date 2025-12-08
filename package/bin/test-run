@@ -825,20 +825,36 @@ async function runTests() {
     let lastActivity = Date.now()
     let inactivityWarnings = 0
 
-    // Warn if no output for 30 seconds (might be a hung test) - skip in JSON mode
-    const inactivityCheck = jsonMode ? null : setInterval(() => {
+    // Mocha default timeout is 2s per test, so 15s of no output means we're hung
+    // In JSON mode, abort and return error JSON
+    const HANG_THRESHOLD_SECONDS = 15
+    const inactivityCheck = setInterval(() => {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
-      if (elapsed >= 30) {
+      if (elapsed >= HANG_THRESHOLD_SECONDS) {
         inactivityWarnings++
-        console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung${colors.reset}`)
-        if (inactivityWarnings >= 3) {
-          console.log(`${colors.dim}  Tip: Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+        if (jsonMode) {
+          clearInterval(inactivityCheck)
+          req.destroy()
+          const output = {
+            success: false,
+            error: 'timeout',
+            inactivity_seconds: elapsed,
+            hint: `No test output for ${elapsed}s (Mocha timeout is 2s). Test is hung. Check: ./scripts/test-run daemon logs -t`,
+            grep: grep || null,
+            file: filePattern || null,
+          }
+          console.log(JSON.stringify(output, null, 2))
+          process.exitCode = 1
+        } else {
+          console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung (Mocha timeout is 2s)${colors.reset}`)
+          if (inactivityWarnings >= 2) {
+            console.log(`${colors.dim}  Tip: Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+          }
         }
       }
-    }, 30000)
+    }, 5000) // Check every 5s
 
     res.on('data', (chunk) => {
-      lastActivity = Date.now()
       buffer += chunk
       const lines = buffer.split('\n\n')
       buffer = lines.pop() || '' // Keep incomplete chunk
@@ -847,6 +863,11 @@ async function runTests() {
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.slice(6))
+            // Only reset activity timer on actual test output, not heartbeats
+            // This way we detect hung tests even if connection is alive
+            if (data.type !== 'heartbeat') {
+              lastActivity = Date.now()
+            }
             handleEvent(data)
           } catch (e) {
             // Ignore parse errors
@@ -856,7 +877,7 @@ async function runTests() {
     })
 
     res.on('end', async () => {
-      if (inactivityCheck) clearInterval(inactivityCheck)
+      clearInterval(inactivityCheck)
 
       // If retrying due to "already running", don't exit
       if (retrying) return
