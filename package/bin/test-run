@@ -858,7 +858,8 @@ async function runTests() {
         await waitForDaemonRestart()
         runTests() // Re-run with same parameters
       } else {
-        process.exit(exitCode)
+        // Use exitCode instead of exit() to allow stdout to flush when piped
+        process.exitCode = exitCode
       }
     })
   })
