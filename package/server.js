@@ -371,7 +371,18 @@ function runDaemonTests(grepPattern, invert, res) {
 
   printHeader('SERVER');
 
+  // Send heartbeat every 10s so client knows we're alive even if tests produce no output
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'heartbeat' })}\n\n`);
+    } catch (e) {
+      clearInterval(heartbeat);
+    }
+  }, 10000);
+
   mochaInstance.run(async (failureCount) => {
+    clearInterval(heartbeat);
+
     // Reset all collections after tests complete to prevent inter-run pollution
     try {
       await resetAllCollections();
