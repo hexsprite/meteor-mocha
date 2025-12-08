@@ -709,6 +709,10 @@ async function runTests() {
           cachePromise = saveCache(outputBuffer, exitCode, failureCount)
         }
         break
+
+      case 'heartbeat':
+        // Server is alive, tests running - handled by data event resetting lastActivity
+        break
     }
   }
 
@@ -720,8 +724,23 @@ async function runTests() {
     }
 
     let buffer = ''
+    let lastActivity = Date.now()
+    let inactivityWarnings = 0
+
+    // Warn if no output for 30 seconds (might be a hung test)
+    const inactivityCheck = setInterval(() => {
+      const elapsed = Math.round((Date.now() - lastActivity) / 1000)
+      if (elapsed >= 30) {
+        inactivityWarnings++
+        console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung${colors.reset}`)
+        if (inactivityWarnings >= 3) {
+          console.log(`${colors.dim}  Tip: Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+        }
+      }
+    }, 30000)
 
     res.on('data', (chunk) => {
+      lastActivity = Date.now()
       buffer += chunk
       const lines = buffer.split('\n\n')
       buffer = lines.pop() || '' // Keep incomplete chunk
@@ -739,6 +758,8 @@ async function runTests() {
     })
 
     res.on('end', async () => {
+      clearInterval(inactivityCheck)
+
       // Wait for cache to be saved before exiting
       if (cachePromise) {
         await cachePromise.catch(() => {}) // Ignore cache errors
