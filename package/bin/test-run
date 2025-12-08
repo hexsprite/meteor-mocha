@@ -11,6 +11,7 @@
  *   ./scripts/test-run daemon start       # Start daemon explicitly
  *   ./scripts/test-run daemon stop        # Stop daemon
  *   ./scripts/test-run daemon status      # Check daemon status
+ *   ./scripts/test-run daemon logs        # Show daemon logs
  */
 
 const http = require('http')
@@ -484,9 +485,18 @@ async function handleDaemonCommand(cmd) {
       await startDaemon()
       process.exit(0)
       break
+    case 'logs':
+      if (fs.existsSync(logFile)) {
+        console.log(`${colors.dim}Log file: ${logFile}${colors.reset}\n`)
+        console.log(fs.readFileSync(logFile, 'utf8'))
+      } else {
+        console.log(`${colors.dim}No log file found at ${logFile}${colors.reset}`)
+      }
+      process.exit(0)
+      break
     default:
       console.error(`Unknown daemon command: ${cmd}`)
-      console.error('Usage: test-run daemon [start|stop|status|restart]')
+      console.error('Usage: test-run daemon [start|stop|status|restart|logs]')
       process.exit(1)
   }
 }
@@ -562,6 +572,7 @@ Daemon Commands:
   daemon stop      Stop the running daemon
   daemon status    Check if daemon is running
   daemon restart   Restart the daemon
+  daemon logs      Show daemon log file
 
 Multiple patterns use OR logic.
 File paths are auto-detected (*.app-spec.ts, *.spec.ts).
