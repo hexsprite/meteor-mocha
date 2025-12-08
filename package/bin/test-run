@@ -652,24 +652,30 @@ async function runTests() {
       const ageSeconds = Math.round(cached.age / 1000)
 
       if (jsonMode) {
-        // Return cached JSON result
-        // For full runs (cached), grep/file/invert are always null/false
-        const output = {
-          success: cached.exitCode === 0,
-          grep: null,
-          file: null,
-          invert: false,
-          cached: true,
-          cached_age_seconds: ageSeconds,
-          ...(cached.jsonResult || {}),
+        // Skip cache if it doesn't have JSON data (was populated without --json)
+        if (!cached.jsonResult) {
+          // Fall through to run tests fresh with JSON reporter
+        } else {
+          // Return cached JSON result
+          // For full runs (cached), grep/file/invert are always null/false
+          const output = {
+            success: cached.exitCode === 0,
+            grep: null,
+            file: null,
+            invert: false,
+            cached: true,
+            cached_age_seconds: ageSeconds,
+            ...cached.jsonResult,
+          }
+          console.log(JSON.stringify(output, null, 2))
+          process.exit(cached.exitCode)
         }
-        console.log(JSON.stringify(output, null, 2))
       } else {
         console.log(`\n${colors.cyan}Using cached result (no files changed, ${ageSeconds}s ago)${colors.reset}\n`)
         console.log(cached.output)
         console.log(`${colors.dim}Test run complete: ${cached.failures} failures (cached)${colors.reset}\n`)
+        process.exit(cached.exitCode)
       }
-      process.exit(cached.exitCode)
     }
   }
 
