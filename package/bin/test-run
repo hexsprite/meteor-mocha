@@ -668,13 +668,15 @@ async function runTests() {
             ...cached.jsonResult,
           }
           console.log(JSON.stringify(output, null, 2))
-          process.exit(cached.exitCode)
+          process.exitCode = cached.exitCode
+          return
         }
       } else {
         console.log(`\n${colors.cyan}Using cached result (no files changed, ${ageSeconds}s ago)${colors.reset}\n`)
         console.log(cached.output)
         console.log(`${colors.dim}Test run complete: ${cached.failures} failures (cached)${colors.reset}\n`)
-        process.exit(cached.exitCode)
+        process.exitCode = cached.exitCode
+        return
       }
     }
   }
