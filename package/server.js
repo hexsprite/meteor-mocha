@@ -346,7 +346,7 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
   // Use JSON reporter if requested, otherwise default to spec
   const useJsonReporter = options.reporter === 'json';
   mochaInstance.color(!useJsonReporter); // No ANSI colors in JSON mode
-  mochaInstance.reporter(useJsonReporter ? 'json' : (serverReporter || reporter || 'spec'), {
+  mochaInstance.reporter(useJsonReporter ? 'json' : (serverReporter || 'spec'), {
     output: serverOutput,
   });
 
