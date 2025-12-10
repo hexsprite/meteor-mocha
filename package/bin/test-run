@@ -301,7 +301,7 @@ async function saveCache(output, exitCode, failures, jsonResult = null) {
   })
 }
 
-async function waitForLockOrDaemon() {
+async function waitForLockOrDaemon(quiet = false) {
   const startTime = Date.now()
   const maxWait = 180000 // 3 minutes max wait
 
@@ -321,8 +321,8 @@ async function waitForLockOrDaemon() {
       return { locked: true }
     }
 
-    // Lock is held - wait and retry
-    process.stdout.write('.')
+    // Lock is held - wait and retry (suppress dots in JSON mode)
+    if (!quiet) process.stdout.write('.')
     await new Promise(r => setTimeout(r, 2000))
   }
 
@@ -339,7 +339,7 @@ async function startDaemon(quiet = false) {
 
   // Try to get lock or wait for another process to start daemon
   if (!quiet) console.log(`${colors.dim}Checking for other startup processes...${colors.reset}`)
-  const lockResult = await waitForLockOrDaemon()
+  const lockResult = await waitForLockOrDaemon(quiet)
 
   if (lockResult.ready) {
     if (!quiet) console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
