@@ -550,7 +550,7 @@ function findSuitesForFile(filePattern) {
 
 function setupDaemonEndpoints() {
   // Health check endpoint
-  WebApp.connectHandlers.use('/test/health', (req, res) => {
+  WebApp.handlers.use('/test/health', (req, res) => {
     const suiteCount = mochaInstance.suite.suites.length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -561,14 +561,14 @@ function setupDaemonEndpoints() {
   });
 
   // File-to-suite mapping endpoint
-  WebApp.connectHandlers.use('/test/files', (req, res) => {
+  WebApp.handlers.use('/test/files', (req, res) => {
     const fileMap = buildFileMap();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(fileMap, null, 2));
   });
 
   // Run tests endpoint (SSE streaming)
-  WebApp.connectHandlers.use('/test/run', (req, res) => {
+  WebApp.handlers.use('/test/run', (req, res) => {
     // Parse query params
     const url = new URL(req.url, `http://${req.headers.host}`);
     const grepPattern = url.searchParams.get('grep') || '';

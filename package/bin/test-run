@@ -397,6 +397,9 @@ async function startDaemon(quiet = false) {
 
     while (Date.now() - startTime < timeout) {
       if (await isDaemonRunning()) {
+        // Give Meteor a moment to fully settle after health check passes
+        // This prevents race conditions where /test/run isn't quite ready yet
+        await new Promise(r => setTimeout(r, 500))
         if (tailer) tailer.stop()
         if (!quiet) console.log(`\n${colors.green}Daemon ready with latest code!${colors.reset}\n`)
         releaseLock()
