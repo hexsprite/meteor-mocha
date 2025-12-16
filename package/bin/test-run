@@ -854,8 +854,26 @@ async function runTests() {
     // Mocha default timeout is 2s per test, so 15s of no output means we're hung
     // In JSON mode, abort and return error JSON
     const HANG_THRESHOLD_SECONDS = 15
-    const inactivityCheck = setInterval(() => {
+    const inactivityCheck = setInterval(async () => {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
+
+      // Check if daemon restarted mid-test
+      if (elapsed >= 5) {
+        const daemonUp = await isDaemonRunning()
+        if (!daemonUp) {
+          clearInterval(inactivityCheck)
+          req.destroy()
+          retrying = true
+          if (!jsonMode) {
+            console.log(`\n${colors.yellow}⚠ Daemon restarted during test run, waiting for it to come back...${colors.reset}`)
+          }
+          // Wait for daemon to come back up, then retry
+          await waitForDaemonRestart()
+          runTests()
+          return
+        }
+      }
+
       if (elapsed >= HANG_THRESHOLD_SECONDS) {
         inactivityWarnings++
         const recentLogs = getRecentLogs(15)
