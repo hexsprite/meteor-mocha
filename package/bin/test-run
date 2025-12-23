@@ -59,16 +59,122 @@ function getRecentLogs(numLines = 20) {
   }
 }
 
-// Check if daemon is running
+// Check if daemon is running and healthy
+// When Meteor crashes, it serves an error HTML page on ALL routes (including /test/health)
+// So we need to verify the response is actually JSON, not the error page
 function isDaemonRunning() {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${port}/test/health`, (res) => {
-      resolve(res.statusCode === 200)
+      if (res.statusCode !== 200) {
+        resolve(false)
+        return
+      }
+
+      // Read the response body to verify it's JSON (not the error HTML page)
+      let data = ''
+      res.on('data', chunk => data += chunk)
+      res.on('end', () => {
+        // If response starts with HTML doctype or contains HTML tags, it's the error page
+        if (data.startsWith('<!DOCTYPE') || data.startsWith('<html') || data.includes('<title>Meteor App - Error</title>')) {
+          resolve(false)
+          return
+        }
+
+        // Try to parse as JSON to verify it's a valid health response
+        try {
+          const health = JSON.parse(data)
+          // Check for expected health response fields
+          resolve(typeof health.suites === 'number' || health.status === 'ok')
+        } catch {
+          // Not valid JSON - probably error page
+          resolve(false)
+        }
+      })
     })
     req.on('error', () => resolve(false))
-    req.setTimeout(1000, () => {
+    req.setTimeout(2000, () => {
       req.destroy()
       resolve(false)
+    })
+  })
+}
+
+/**
+ * Get crash diagnostics from the server's HTML error page
+ * When Meteor crashes, it serves an HTML page with the error at the root URL
+ * Returns null if server is healthy or not responding at all
+ */
+function getServerCrashDiagnostics() {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${port}/`, (res) => {
+      let html = ''
+      res.on('data', chunk => html += chunk)
+      res.on('end', () => {
+        // Check if this looks like a Meteor crash page
+        if (!html.includes('Your app is crashing') && !html.includes('Error:') && !html.includes('error:')) {
+          resolve(null) // Not a crash page
+          return
+        }
+
+        // Extract error message from HTML
+        // Meteor formats errors in <pre> tags or as plain text
+        let errorMessage = null
+
+        // Try to find error in <pre> tags
+        const preMatch = html.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i)
+        if (preMatch) {
+          errorMessage = preMatch[1]
+            .replace(/<[^>]+>/g, '') // Strip HTML tags
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .trim()
+        }
+
+        // Try to find "Error:" pattern in body
+        if (!errorMessage) {
+          const errorMatch = html.match(/Error:\s*([^\n<]+)/i)
+          if (errorMatch) {
+            errorMessage = errorMatch[0].trim()
+          }
+        }
+
+        // Try to find MODULE_NOT_FOUND or similar patterns
+        if (!errorMessage) {
+          const moduleMatch = html.match(/Cannot find module ['"]([^'"]+)['"]/i)
+          if (moduleMatch) {
+            errorMessage = `Cannot find module '${moduleMatch[1]}'`
+          }
+        }
+
+        // Extract stack trace if present
+        let stackTrace = null
+        const stackMatch = html.match(/at\s+[\w.<>]+\s+\([^)]+\)[\s\S]*?(?=<\/|$)/i)
+        if (stackMatch) {
+          stackTrace = stackMatch[0]
+            .replace(/<[^>]+>/g, '')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&')
+            .split('\n')
+            .slice(0, 10) // Limit stack trace lines
+            .map(l => l.trim())
+            .filter(l => l)
+        }
+
+        resolve({
+          crashed: true,
+          error: errorMessage || 'Server crashed (unable to parse error message)',
+          stack: stackTrace,
+          hint: 'Server crashed during startup. Check the error above and fix before running tests.',
+        })
+      })
+    })
+    req.on('error', () => resolve(null)) // Server not responding at all
+    req.setTimeout(2000, () => {
+      req.destroy()
+      resolve(null)
     })
   })
 }
@@ -394,8 +500,38 @@ async function startDaemon(quiet = false) {
     if (!quiet) console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
     const startTime = Date.now()
     const timeout = 120000 // 2 minutes
+    const daemonPid = child.pid
 
     while (Date.now() - startTime < timeout) {
+      // Check if daemon process crashed (exited early)
+      if (!isProcessRunning(daemonPid)) {
+        if (tailer) tailer.stop()
+
+        // Process died - extract error from logs immediately
+        const recentLogs = getRecentLogs(30)
+        const errorLines = recentLogs.filter(l =>
+          l.includes('Error') || l.includes('error:') || l.includes('TypeError') ||
+          l.includes('SyntaxError') || l.includes('Cannot find module') || l.includes('EADDRINUSE')
+        )
+
+        if (!quiet) {
+          console.error(`\n${colors.red}Daemon crashed during startup${colors.reset}`)
+          if (errorLines.length > 0) {
+            console.error(`${colors.red}Error:${colors.reset}`)
+            errorLines.slice(-5).forEach(line => console.error(`  ${colors.red}${line}${colors.reset}`))
+          }
+          console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
+        }
+
+        releaseLock()
+        return {
+          started: false,
+          error: 'daemon_crashed',
+          message: errorLines.length > 0 ? errorLines.slice(-1)[0] : 'Daemon crashed during startup',
+          logs: errorLines.slice(-10),
+        }
+      }
+
       if (await isDaemonRunning()) {
         // Give Meteor a moment to fully settle after health check passes
         // This prevents race conditions where /test/run isn't quite ready yet
@@ -409,10 +545,30 @@ async function startDaemon(quiet = false) {
     }
 
     if (tailer) tailer.stop()
-    console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
-    console.error(`${colors.dim}See errors above or check: ${logFile}${colors.reset}`)
+
+    // Extract error from log file for better diagnostics
+    const recentLogs = getRecentLogs(30)
+    const errorLines = recentLogs.filter(l =>
+      l.includes('Error') || l.includes('error:') || l.includes('TypeError') ||
+      l.includes('SyntaxError') || l.includes('Cannot find module')
+    )
+
+    if (!quiet) {
+      console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
+      if (errorLines.length > 0) {
+        console.error(`\n${colors.red}Error from logs:${colors.reset}`)
+        errorLines.slice(-5).forEach(line => console.error(`  ${colors.red}${line}${colors.reset}`))
+      }
+      console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
+    }
+
     releaseLock()
-    return false
+    return {
+      started: false,
+      error: 'startup_timeout',
+      message: errorLines.length > 0 ? errorLines.slice(-1)[0] : 'Daemon failed to start within timeout',
+      logs: errorLines.slice(-10),
+    }
   } catch (err) {
     releaseLock()
     throw err
@@ -716,21 +872,66 @@ async function runTests() {
     }
   }
 
-  // Check if daemon is running, auto-start if not
-  if (!await isDaemonRunning()) {
-    if (!jsonMode) {
-      console.log(`${colors.yellow}Daemon not running, starting fresh (will load latest code)...${colors.reset}\n`)
-    }
-    const started = await startDaemon(jsonMode) // Pass quiet flag for JSON mode
-    if (!started) {
-      process.exit(1)
-    }
-  }
-
-  // Combine patterns with OR regex
+  // Combine patterns with OR regex (defined early for error reporting)
   const grep = testNamePatterns.length > 0
     ? testNamePatterns.map(p => `(${p})`).join('|')
     : ''
+
+  // Check if daemon is running, auto-start if not
+  if (!await isDaemonRunning()) {
+    // Check if server is crashed (serving error page but health check fails)
+    const crashDiagnostics = await getServerCrashDiagnostics()
+    if (crashDiagnostics) {
+      if (jsonMode) {
+        const output = {
+          success: false,
+          error: 'server_crashed',
+          message: crashDiagnostics.error,
+          stack: crashDiagnostics.stack,
+          hint: crashDiagnostics.hint,
+          grep: grep || null,
+          file: filePattern || null,
+          stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+        }
+        console.log(JSON.stringify(output, null, 2))
+        process.exitCode = 1
+        return
+      } else {
+        console.log(`\n${colors.red}Server crashed:${colors.reset}`)
+        console.log(`${colors.red}${crashDiagnostics.error}${colors.reset}`)
+        if (crashDiagnostics.stack) {
+          console.log(`${colors.dim}${crashDiagnostics.stack.join('\n')}${colors.reset}`)
+        }
+        console.log(`\n${colors.yellow}${crashDiagnostics.hint}${colors.reset}\n`)
+        process.exitCode = 1
+        return
+      }
+    }
+
+    if (!jsonMode) {
+      console.log(`${colors.yellow}Daemon not running, starting fresh (will load latest code)...${colors.reset}\n`)
+    }
+    const startResult = await startDaemon(jsonMode) // Pass quiet flag for JSON mode
+
+    // Handle startup failure
+    if (startResult !== true) {
+      if (jsonMode) {
+        const output = {
+          success: false,
+          error: startResult.error || 'startup_failed',
+          message: startResult.message,
+          logs: startResult.logs,
+          hint: 'Daemon failed to start. Check the error and fix before running tests.',
+          grep: grep || null,
+          file: filePattern || null,
+          stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+        }
+        console.log(JSON.stringify(output, null, 2))
+      }
+      process.exitCode = 1
+      return
+    }
+  }
 
   const params = new URLSearchParams()
   if (grep) params.set('grep', grep)
@@ -766,12 +967,17 @@ async function runTests() {
   let retrying = false
   let jsonResult = null // Parsed JSON from Mocha reporter
   const startTime = Date.now()
+  let testCount = 0  // Track number of tests for progress reporting
 
-  function handleEvent(data) {
+  function handleEvent(data, setTestsStarted) {
     switch (data.type) {
       case 'start':
+        setTestsStarted()  // Signal that tests have begun running
         if (!jsonMode) {
           console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
+        } else {
+          // Output progress to stderr so stdout remains valid JSON
+          console.error(`[${Math.round((Date.now() - startTime) / 1000)}s] Starting tests...`)
         }
         break
 
@@ -779,6 +985,15 @@ async function runTests() {
         // Raw console output from Mocha (already has ANSI colors)
         if (!jsonMode) {
           console.log(data.data)
+        } else {
+          // In JSON mode, output progress to stderr for each test result line
+          // Detect test results: lines with ✓ (pass) or ✗ (fail) or numbered items
+          const line = data.data || ''
+          if (line.includes('✓') || line.includes('✗') || line.match(/^\s*\d+\)/)) {
+            testCount++
+            const elapsed = Math.round((Date.now() - startTime) / 1000)
+            console.error(`[${elapsed}s] ${line.trim()}`)
+          }
         }
         outputBuffer += data.data + '\n'
         break
@@ -811,21 +1026,49 @@ async function runTests() {
         exitCode = data.failures > 0 ? 1 : 0
         failureCount = data.failures
 
+        // Check for no tests matched when a pattern was specified
+        const hasPattern = grep || filePattern
+        const testCount = jsonResult?.stats?.tests ?? data.tests ?? 0
+        if (hasPattern && testCount === 0) {
+          exitCode = 1  // Treat as error - pattern matched nothing
+        }
+
         if (jsonMode) {
-          // Build final JSON output
-          const duration = Date.now() - startTime
+          // Output final progress to stderr
+          const durationMs = Date.now() - startTime
+          const durationSec = Math.round(durationMs / 1000)
+          const noTestsMatched = hasPattern && testCount === 0
+          const status = noTestsMatched ? '⚠ NO MATCH' : (data.failures > 0 ? '✗ FAILED' : '✓ PASSED')
+          console.error(`[${durationSec}s] ${status} (${data.failures} failures)`)
+
+          // Default stats for consistent output when jsonResult is missing or incomplete
+          const defaultStats = { suites: 0, tests: 0, passes: 0, pending: 0, failures: data.failures || 0 }
+
+          // Build final JSON output (stdout)
           const output = {
             success: exitCode === 0,
+            ...(noTestsMatched ? {
+              error: 'no_tests_matched',
+              message: `No tests matched pattern: ${grep || filePattern}`,
+              hint: 'Check the pattern - use -t for test names, file paths for specific files.',
+            } : {
+              hint: 'Fresh run. Results cached for 1 min unless source files change.',
+            }),
             grep: grep || null,
             file: filePattern || null,
             invert: invert || false,
-            duration_ms: duration,
-            hint: 'Fresh run. Results cached for 1 min unless source files change.',
+            duration_ms: durationMs,
+            stats: defaultStats,
             ...(jsonResult || {}),
           }
           console.log(JSON.stringify(output, null, 2))
         } else {
-          console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+          if (hasPattern && testCount === 0) {
+            console.log(`\n${colors.yellow}⚠ No tests matched pattern: ${grep || filePattern}${colors.reset}`)
+            console.log(`${colors.dim}Check the pattern - use -t for test names, file paths for specific files.${colors.reset}\n`)
+          } else {
+            console.log(`\n${colors.dim}Test run complete: ${data.failures} failures${colors.reset}\n`)
+          }
         }
 
         // Save to cache for full runs (store promise to await later)
@@ -850,10 +1093,13 @@ async function runTests() {
     let buffer = ''
     let lastActivity = Date.now()
     let inactivityWarnings = 0
+    let testsStarted = false  // Track if we've received the 'start' event from Mocha
 
-    // Mocha default timeout is 2s per test, so 15s of no output means we're hung
-    // In JSON mode, abort and return error JSON
-    const HANG_THRESHOLD_SECONDS = 15
+    // Two-phase timeout:
+    // - Before 'start' event: 120s (Mocha is loading/discovering tests after daemon rebuild)
+    // - After 'start' event: 15s (Mocha default is 2s per test, so 15s means hung)
+    const INITIAL_TIMEOUT_SECONDS = 120  // Wait up to 2 min for tests to start loading
+    const HANG_THRESHOLD_SECONDS = 15    // After tests start, 15s silence = hung
     const inactivityCheck = setInterval(async () => {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
 
@@ -874,25 +1120,69 @@ async function runTests() {
         }
       }
 
-      if (elapsed >= HANG_THRESHOLD_SECONDS) {
+      // Use different thresholds based on whether tests have started
+      const threshold = testsStarted ? HANG_THRESHOLD_SECONDS : INITIAL_TIMEOUT_SECONDS
+
+      if (elapsed >= threshold) {
         inactivityWarnings++
         const recentLogs = getRecentLogs(15)
+
+        // Check if server crashed during test run
+        const crashDiagnostics = await getServerCrashDiagnostics()
+        if (crashDiagnostics) {
+          clearInterval(inactivityCheck)
+          req.destroy()
+          if (jsonMode) {
+            const output = {
+              success: false,
+              error: 'server_crashed',
+              message: crashDiagnostics.error,
+              stack: crashDiagnostics.stack,
+              hint: crashDiagnostics.hint,
+              grep: grep || null,
+              file: filePattern || null,
+              stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+            }
+            console.log(JSON.stringify(output, null, 2))
+            process.exitCode = 1
+          } else {
+            console.log(`\n${colors.red}Server crashed during tests:${colors.reset}`)
+            console.log(`${colors.red}${crashDiagnostics.error}${colors.reset}`)
+            if (crashDiagnostics.stack) {
+              console.log(`${colors.dim}${crashDiagnostics.stack.join('\n')}${colors.reset}`)
+            }
+            console.log(`\n${colors.yellow}${crashDiagnostics.hint}${colors.reset}\n`)
+            process.exitCode = 1
+          }
+          return
+        }
+
         if (jsonMode) {
           clearInterval(inactivityCheck)
           req.destroy()
+          const phase = testsStarted ? 'during tests' : 'before tests started'
+          const hint = testsStarted
+            ? `No test output for ${elapsed}s (Mocha timeout is 2s). Test is hung.`
+            : `Tests did not start within ${elapsed}s. Mocha may be stuck loading.`
           const output = {
             success: false,
             error: 'timeout',
             inactivity_seconds: elapsed,
-            hint: `No test output for ${elapsed}s (Mocha timeout is 2s). Test is hung.`,
+            tests_started: testsStarted,
+            hint,
             grep: grep || null,
             file: filePattern || null,
             recent_logs: recentLogs,
+            stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
           }
           console.log(JSON.stringify(output, null, 2))
           process.exitCode = 1
         } else {
-          console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung (Mocha timeout is 2s)${colors.reset}`)
+          if (testsStarted) {
+            console.log(`${colors.yellow}⚠ No output for ${elapsed}s - test may be hung (Mocha timeout is 2s)${colors.reset}`)
+          } else {
+            console.log(`${colors.yellow}⚠ Tests haven't started yet (${elapsed}s) - Mocha may be stuck loading${colors.reset}`)
+          }
           if (inactivityWarnings >= 2) {
             console.log(`${colors.dim}  Tip: Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
           }
@@ -919,7 +1209,7 @@ async function runTests() {
             if (data.type !== 'heartbeat') {
               lastActivity = Date.now()
             }
-            handleEvent(data)
+            handleEvent(data, () => { testsStarted = true })
           } catch (e) {
             // Ignore parse errors
           }
