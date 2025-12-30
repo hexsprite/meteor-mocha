@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* eslint-disable max-lines */
 /* eslint-disable no-console, max-len, complexity */
 
 // Suppress experimental warnings (e.g., fs.glob) to keep output clean
@@ -84,7 +85,12 @@ function isDaemonRunning() {
         try {
           const health = JSON.parse(data)
           // Check for expected health response fields
-          resolve(typeof health.suites === 'number' || health.status === 'ok')
+          // Also reject if status is 'shutting_down' (hot reload in progress)
+          if (health.status === 'shutting_down') {
+            resolve(false)
+            return
+          }
+          resolve(typeof health.suites === 'number' || health.status === 'ok' || health.status === 'ready')
         } catch {
           // Not valid JSON - probably error page
           resolve(false)
@@ -720,7 +726,7 @@ function isFilePath(arg) {
          arg.includes('.spec.') ||
          arg.includes('.test.') ||
          arg.endsWith('/') ||
-         arg.includes('/') && !arg.includes('.')  // directory path like imports/api/calendar
+         arg.includes('/') && !arg.includes('.') // directory path like imports/api/calendar
 }
 
 /**
@@ -967,12 +973,12 @@ async function runTests() {
   let retrying = false
   let jsonResult = null // Parsed JSON from Mocha reporter
   const startTime = Date.now()
-  let testCount = 0  // Track number of tests for progress reporting
+  const testCount = 0 // Track number of tests for progress reporting
 
   function handleEvent(data, setTestsStarted) {
     switch (data.type) {
       case 'start':
-        setTestsStarted()  // Signal that tests have begun running
+        setTestsStarted() // Signal that tests have begun running
         if (!jsonMode) {
           console.log(`${colors.dim}Starting: ${data.grep}${data.invert ? ' (inverted)' : ''}${colors.reset}`)
         } else {
@@ -1013,6 +1019,16 @@ async function runTests() {
         outputBuffer += data.data + '\n'
         break
 
+      case 'shutdown':
+        // Server is shutting down (hot reload), wait and retry
+        if (!jsonMode) {
+          console.log(`\n${colors.yellow}⚠ Server restarting (${data.reason}), waiting for daemon to come back...${colors.reset}`)
+        }
+        retrying = true
+        // Wait for daemon to restart and retry
+        waitForDaemonRestart().then(() => runTests())
+        return // Don't continue processing
+
       case 'json':
         // Mocha JSON reporter output
         try {
@@ -1030,7 +1046,7 @@ async function runTests() {
         const hasPattern = grep || filePattern
         const testCount = jsonResult?.stats?.tests ?? data.tests ?? 0
         if (hasPattern && testCount === 0) {
-          exitCode = 1  // Treat as error - pattern matched nothing
+          exitCode = 1 // Treat as error - pattern matched nothing
         }
 
         if (jsonMode) {
@@ -1093,13 +1109,13 @@ async function runTests() {
     let buffer = ''
     let lastActivity = Date.now()
     let inactivityWarnings = 0
-    let testsStarted = false  // Track if we've received the 'start' event from Mocha
+    let testsStarted = false // Track if we've received the 'start' event from Mocha
 
     // Two-phase timeout:
     // - Before 'start' event: 120s (Mocha is loading/discovering tests after daemon rebuild)
     // - After 'start' event: 15s (Mocha default is 2s per test, so 15s means hung)
-    const INITIAL_TIMEOUT_SECONDS = 120  // Wait up to 2 min for tests to start loading
-    const HANG_THRESHOLD_SECONDS = 15    // After tests start, 15s silence = hung
+    const INITIAL_TIMEOUT_SECONDS = 120 // Wait up to 2 min for tests to start loading
+    const HANG_THRESHOLD_SECONDS = 15 // After tests start, 15s silence = hung
     const inactivityCheck = setInterval(async () => {
       const elapsed = Math.round((Date.now() - lastActivity) / 1000)
 
