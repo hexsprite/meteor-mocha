@@ -296,6 +296,33 @@ function clientTests() {
 // Daemon mode: run tests on-demand via HTTP instead of at startup
 let daemonTestsRunning = false;
 let clientDisconnected = false;
+let shuttingDown = false;
+
+// Track active SSE connections for graceful shutdown
+const activeConnections = new Set();
+
+// Graceful shutdown: notify all connected clients before server restarts
+function setupShutdownHandlers() {
+  const shutdown = (signal) => {
+    if (shuttingDown) return; // Prevent double-handling
+    shuttingDown = true;
+    console.log(`[daemon] Received ${signal}, notifying clients...`);
+
+    // Notify all active SSE connections
+    for (const res of activeConnections) {
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'shutdown', reason: signal })}\n\n`);
+        res.end();
+      } catch (e) {
+        // Connection may already be closed
+      }
+    }
+    activeConnections.clear();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
 
 function runDaemonTests(grepPattern, invert, res, options = {}) {
   if (daemonTestsRunning) {
@@ -304,8 +331,18 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     return;
   }
 
+  // Reject new test runs if shutting down
+  if (shuttingDown) {
+    res.write(`data: ${JSON.stringify({ type: 'shutdown', reason: 'Server is shutting down' })}\n\n`);
+    res.end();
+    return;
+  }
+
   daemonTestsRunning = true;
   clientDisconnected = false;
+
+  // Track this connection for graceful shutdown
+  activeConnections.add(res);
 
   // Set snapshot update mode if requested (for snapshot testing)
   const previousSnapshotUpdate = process.env.SNAPSHOT_UPDATE;
@@ -441,6 +478,7 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     }
 
     daemonTestsRunning = false;
+    activeConnections.delete(res);
 
     if (clientDisconnected) {
       console.log(`[daemon] Tests completed (${failureCount} failures) but client already disconnected`);
@@ -549,12 +587,15 @@ function findSuitesForFile(filePattern) {
 }
 
 function setupDaemonEndpoints() {
+  // Set up graceful shutdown handlers
+  setupShutdownHandlers();
+
   // Health check endpoint
   WebApp.handlers.use('/test/health', (req, res) => {
     const suiteCount = mochaInstance.suite.suites.length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ready',
+      status: shuttingDown ? 'shutting_down' : 'ready',
       suites: suiteCount,
       running: daemonTestsRunning,
     }));
