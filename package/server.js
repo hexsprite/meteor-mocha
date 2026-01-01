@@ -257,6 +257,12 @@ function clientTests() {
     return;
   }
 
+  // Guard against race condition: client-refresh can fire before start() sets runnerOptions
+  if (!runnerOptions) {
+    console.log('SKIPPING CLIENT TESTS - runner not yet initialized');
+    return;
+  }
+
   if (!runnerOptions.runClient) {
     console.log('SKIPPING CLIENT TESTS BECAUSE TEST_CLIENT=0');
     exitIfDone('client', 0);
