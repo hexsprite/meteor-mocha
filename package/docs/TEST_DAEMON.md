@@ -157,6 +157,7 @@ data: {"type": "done", "failures": 1}
 |----------|---------|-------------|
 | `TEST_PORT` | `9100` | Port for daemon HTTP server |
 | `TEST_DAEMON` | - | Set to any value to enable daemon mode |
+| `TEST_DAEMON_RELOAD_FILE` | `imports/startup/tests/server.ts` | File to touch when triggering a hot reload after Mongo timeouts |
 
 ## File Tracking
 

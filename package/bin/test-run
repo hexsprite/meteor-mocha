@@ -33,6 +33,15 @@ const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
 const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
 const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
 const CACHE_TTL_MS = 60000 // 1 minute
+const HEALTH_CHECK_TIMEOUT_MS = 2000
+const RESTART_WAIT_TIMEOUT_MS = 120000
+const DEFAULT_HOT_RELOAD_FILE = path.join(
+  process.cwd(),
+  'imports',
+  'startup',
+  'tests',
+  'server.ts',
+)
 
 // Colors
 const colors = {
@@ -42,6 +51,74 @@ const colors = {
   cyan: '\x1b[36m',
   dim: '\x1b[2m',
   reset: '\x1b[0m',
+}
+
+const errorLineSnippets = [
+  'Error',
+  'error:',
+  'TypeError',
+  'SyntaxError',
+  'Cannot find module',
+  'EADDRINUSE',
+  "Can't listen on port",
+  'Running two copies of Meteor',
+  'FATAL ERROR',
+  'heap out of memory',
+]
+
+function isDaemonErrorLine(line) {
+  return errorLineSnippets.some(snippet => line.includes(snippet))
+}
+
+const mongoTimeoutSnippets = [
+  'server monitor timeout',
+  'PoolClearedOnNetworkError',
+  'MongoServerSelectionError',
+  'MongoNetworkError',
+  'Connection to 127.0.0.1:9101',
+]
+
+function isMongoTimeoutMessage(message) {
+  if (!message) return false
+  return mongoTimeoutSnippets.some(snippet => message.includes(snippet))
+}
+
+function getHotReloadFilePath() {
+  return process.env.TEST_DAEMON_RELOAD_FILE || DEFAULT_HOT_RELOAD_FILE
+}
+
+function touchHotReloadFile(filePath = getHotReloadFilePath()) {
+  const resolvedPath = path.resolve(filePath)
+  try {
+    const now = new Date()
+    fs.utimesSync(resolvedPath, now, now)
+    return { touched: true, path: resolvedPath }
+  } catch (error) {
+    return {
+      touched: false,
+      path: resolvedPath,
+      error: error?.message || String(error),
+    }
+  }
+}
+
+function hasMongoTimeoutEvidence(crashDiagnostics, recentLogs = [], extraMessages = []) {
+  const candidates = []
+
+  if (crashDiagnostics?.error) {
+    candidates.push(crashDiagnostics.error)
+  }
+  if (Array.isArray(crashDiagnostics?.stack) && crashDiagnostics.stack.length > 0) {
+    candidates.push(crashDiagnostics.stack.join('\n'))
+  }
+  if (Array.isArray(recentLogs)) {
+    candidates.push(...recentLogs)
+  }
+  if (Array.isArray(extraMessages)) {
+    candidates.push(...extraMessages)
+  }
+
+  return candidates.some(isMongoTimeoutMessage)
 }
 
 /**
@@ -60,14 +137,42 @@ function getRecentLogs(numLines = 20) {
   }
 }
 
+function isHtmlErrorResponse(data) {
+  const trimmed = data.trimStart()
+  return trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<html') ||
+    trimmed.includes('<title>Meteor App - Error</title>')
+}
+
+function parseDaemonHealthResponse(data) {
+  if (isHtmlErrorResponse(data)) {
+    return { status: 'down' }
+  }
+
+  try {
+    const health = JSON.parse(data)
+    const suites = typeof health.suites === 'number' ? health.suites : undefined
+    if (health.status === 'shutting_down' || health.status === 'restarting') {
+      return { status: 'restarting', suites }
+    }
+    if (typeof health.suites === 'number' || health.status === 'ok' || health.status === 'ready') {
+      return { status: 'ready', suites }
+    }
+  } catch {
+    // Not valid JSON - probably error page
+  }
+
+  return { status: 'down' }
+}
+
 // Check if daemon is running and healthy
 // When Meteor crashes, it serves an error HTML page on ALL routes (including /test/health)
 // So we need to verify the response is actually JSON, not the error page
-function isDaemonRunning() {
+function getDaemonStatus() {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${port}/test/health`, (res) => {
       if (res.statusCode !== 200) {
-        resolve(false)
+        resolve({ status: 'down' })
         return
       }
 
@@ -75,34 +180,20 @@ function isDaemonRunning() {
       let data = ''
       res.on('data', chunk => data += chunk)
       res.on('end', () => {
-        // If response starts with HTML doctype or contains HTML tags, it's the error page
-        if (data.startsWith('<!DOCTYPE') || data.startsWith('<html') || data.includes('<title>Meteor App - Error</title>')) {
-          resolve(false)
-          return
-        }
-
-        // Try to parse as JSON to verify it's a valid health response
-        try {
-          const health = JSON.parse(data)
-          // Check for expected health response fields
-          // Also reject if status is 'shutting_down' (hot reload in progress)
-          if (health.status === 'shutting_down') {
-            resolve(false)
-            return
-          }
-          resolve(typeof health.suites === 'number' || health.status === 'ok' || health.status === 'ready')
-        } catch {
-          // Not valid JSON - probably error page
-          resolve(false)
-        }
+        resolve(parseDaemonHealthResponse(data))
       })
     })
-    req.on('error', () => resolve(false))
-    req.setTimeout(2000, () => {
+    req.on('error', () => resolve({ status: 'down' }))
+    req.setTimeout(HEALTH_CHECK_TIMEOUT_MS, () => {
       req.destroy()
-      resolve(false)
+      resolve({ status: 'down' })
     })
   })
+}
+
+async function isDaemonRunning() {
+  const status = await getDaemonStatus()
+  return status.status === 'ready'
 }
 
 /**
@@ -220,6 +311,26 @@ function isProcessRunning(pid) {
   } catch {
     return false
   }
+}
+
+function terminateProcess(pid) {
+  if (!pid) return
+  try {
+    process.kill(-pid, 'SIGTERM')
+  } catch {
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {
+      // Process already dead
+    }
+  }
+}
+
+function cleanupFailedStart(pid) {
+  if (pid && isProcessRunning(pid)) {
+    terminateProcess(pid)
+  }
+  removePid()
 }
 
 // Lock file management to prevent race conditions
@@ -413,22 +524,96 @@ async function saveCache(output, exitCode, failures, jsonResult = null) {
   })
 }
 
+function createJsonProgressLogger(options = {}) {
+  const startTime = options.startTime ?? Date.now()
+  const now = options.now ?? Date.now
+  const write = options.write ?? console.error
+  let testCount = 0
+
+  return {
+    handleLogLine(rawLine) {
+      const line = rawLine || ''
+      if (line.includes('✓') || line.includes('✗') || line.match(/^\s*\d+\)/)) {
+        testCount += 1
+        const elapsed = Math.round((now() - startTime) / 1000)
+        write(`[${elapsed}s] ${line.trim()}`)
+      }
+    },
+    getCount() {
+      return testCount
+    },
+  }
+}
+
+function createRestartLoopTracker(options = {}) {
+  const windowMs = options.windowMs ?? 60000
+  const maxRestarts = options.maxRestarts ?? 3
+  const now = options.now ?? Date.now
+  let restarts = []
+
+  return {
+    recordRestart() {
+      const current = now()
+      restarts = restarts.filter(ts => current - ts < windowMs)
+      restarts.push(current)
+      return restarts.length >= maxRestarts
+    },
+    reset() {
+      restarts = []
+    },
+    getCount() {
+      return restarts.length
+    },
+  }
+}
+
+const restartLoopTracker = createRestartLoopTracker()
+
+function getTestCountFromResult(jsonResult, data) {
+  if (jsonResult?.stats && typeof jsonResult.stats.tests === 'number') {
+    return jsonResult.stats.tests
+  }
+  if (data && typeof data.tests === 'number') {
+    return data.tests
+  }
+  return null
+}
+
+function shouldReportNoTestsMatched(hasPattern, jsonResult, data) {
+  const testCount = getTestCountFromResult(jsonResult, data)
+  return hasPattern && testCount === 0
+}
+
 async function waitForLockOrDaemon(quiet = false) {
   const startTime = Date.now()
   const maxWait = 180000 // 3 minutes max wait
 
   while (Date.now() - startTime < maxWait) {
     // If daemon is now running, we're good
-    if (await isDaemonRunning()) {
+    const status = await getDaemonStatus()
+    if (status.status === 'ready') {
       return { ready: true }
+    }
+
+    if (status.status === 'restarting') {
+      if (!quiet) process.stdout.write('.')
+      await new Promise(r => setTimeout(r, 2000))
+      continue
     }
 
     // Try to acquire lock
     if (acquireLock()) {
       // Check one more time - daemon might have started while we waited
-      if (await isDaemonRunning()) {
+      const recheckStatus = await getDaemonStatus()
+      if (recheckStatus.status === 'ready') {
         releaseLock()
         return { ready: true }
+      }
+      if (recheckStatus.status === 'restarting') {
+        releaseLock()
+        if (!quiet) process.stdout.write('.')
+        await new Promise(r => setTimeout(r, 2000))
+        continue
       }
       return { locked: true }
     }
@@ -444,9 +629,25 @@ async function waitForLockOrDaemon(quiet = false) {
 // Start daemon in background
 async function startDaemon(quiet = false) {
   // Check if already running
-  if (await isDaemonRunning()) {
+  const initialStatus = await getDaemonStatus()
+  if (initialStatus.status === 'ready') {
     if (!quiet) console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
     return true
+  }
+  if (initialStatus.status === 'restarting') {
+    if (!quiet) console.log(`${colors.dim}Daemon restarting, waiting for it to come back...${colors.reset}`)
+    const restarted = await waitForDaemonRestart({ log: quiet ? null : console.log })
+    if (restarted) {
+      if (!quiet) console.log(`${colors.green}Daemon already running on port ${port}${colors.reset}`)
+      return true
+    }
+    if (!quiet) console.error(`${colors.red}Daemon did not restart within timeout${colors.reset}`)
+    return {
+      started: false,
+      error: 'restart_timeout',
+      message: 'Daemon did not restart within timeout',
+      logs: getRecentLogs(10),
+    }
   }
 
   // Try to get lock or wait for another process to start daemon
@@ -515,10 +716,7 @@ async function startDaemon(quiet = false) {
 
         // Process died - extract error from logs immediately
         const recentLogs = getRecentLogs(30)
-        const errorLines = recentLogs.filter(l =>
-          l.includes('Error') || l.includes('error:') || l.includes('TypeError') ||
-          l.includes('SyntaxError') || l.includes('Cannot find module') || l.includes('EADDRINUSE')
-        )
+        const errorLines = recentLogs.filter(isDaemonErrorLine)
 
         if (!quiet) {
           console.error(`\n${colors.red}Daemon crashed during startup${colors.reset}`)
@@ -529,6 +727,7 @@ async function startDaemon(quiet = false) {
           console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
         }
 
+        cleanupFailedStart(daemonPid)
         releaseLock()
         return {
           started: false,
@@ -554,10 +753,7 @@ async function startDaemon(quiet = false) {
 
     // Extract error from log file for better diagnostics
     const recentLogs = getRecentLogs(30)
-    const errorLines = recentLogs.filter(l =>
-      l.includes('Error') || l.includes('error:') || l.includes('TypeError') ||
-      l.includes('SyntaxError') || l.includes('Cannot find module')
-    )
+    const errorLines = recentLogs.filter(isDaemonErrorLine)
 
     if (!quiet) {
       console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
@@ -568,6 +764,7 @@ async function startDaemon(quiet = false) {
       console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
     }
 
+    cleanupFailedStart(daemonPid)
     releaseLock()
     return {
       started: false,
@@ -582,23 +779,18 @@ async function startDaemon(quiet = false) {
 }
 
 // Stop daemon
-async function stopDaemon() {
+async function stopDaemon(quiet = false) {
   const pid = readPid()
   if (pid && isProcessRunning(pid)) {
-    console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
-    try {
-      // Kill the process group to get all child processes
-      process.kill(-pid, 'SIGTERM')
-    } catch {
-      // Try killing just the process
-      try {
-        process.kill(pid, 'SIGTERM')
-      } catch {
-        // Process already dead
-      }
+    if (!quiet) {
+      console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
     }
+    // Kill the process group to get all child processes
+    terminateProcess(pid)
     removePid()
-    console.log(`${colors.green}Daemon stopped${colors.reset}`)
+    if (!quiet) {
+      console.log(`${colors.green}Daemon stopped${colors.reset}`)
+    }
   } else {
     // Try to find and kill by port
     try {
@@ -608,28 +800,36 @@ async function stopDaemon() {
         for (const p of pids) {
           try {
             process.kill(parseInt(p, 10), 'SIGTERM')
-            console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
+            if (!quiet) {
+              console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
+            }
           } catch {
             // Process already dead
           }
         }
         removePid()
-        console.log(`${colors.green}Daemon stopped${colors.reset}`)
+        if (!quiet) {
+          console.log(`${colors.green}Daemon stopped${colors.reset}`)
+        }
       } else {
-        console.log(`${colors.dim}No daemon running${colors.reset}`)
+        if (!quiet) {
+          console.log(`${colors.dim}No daemon running${colors.reset}`)
+        }
       }
     } catch {
-      console.log(`${colors.dim}No daemon running${colors.reset}`)
+      if (!quiet) {
+        console.log(`${colors.dim}No daemon running${colors.reset}`)
+      }
     }
   }
 }
 
 // Show daemon status
 async function daemonStatus() {
-  const running = await isDaemonRunning()
+  const status = await getDaemonStatus()
   const pid = readPid()
 
-  if (running) {
+  if (status.status === 'ready') {
     console.log(`${colors.green}Daemon is running on port ${port}${colors.reset}`)
     if (pid) {
       console.log(`${colors.dim}PID: ${pid}${colors.reset}`)
@@ -646,6 +846,11 @@ async function daemonStatus() {
       console.log(`${colors.dim}Suites: ${health.suites}${colors.reset}`)
     } catch {
       // Ignore
+    }
+  } else if (status.status === 'restarting') {
+    console.log(`${colors.yellow}Daemon is restarting...${colors.reset}`)
+    if (pid) {
+      console.log(`${colors.dim}PID: ${pid}${colors.reset}`)
     }
   } else {
     console.log(`${colors.red}Daemon is not running${colors.reset}`)
@@ -707,8 +912,8 @@ async function handleDaemonCommand(cmd) {
 }
 
 // Parse args
-const args = process.argv.slice(2)
-const testNamePatterns = []
+let args = []
+let testNamePatterns = []
 let filePattern = ''
 let invert = false
 let watchMode = false
@@ -742,10 +947,22 @@ function normalizePath(filepath) {
   return normalized
 }
 
-// Check for daemon commands first
-if (args[0] === 'daemon') {
-  handleDaemonCommand(args[1] || 'status')
-} else {
+function main(argv = process.argv.slice(2)) {
+  args = argv
+  testNamePatterns = []
+  filePattern = ''
+  invert = false
+  watchMode = false
+  jsonMode = false
+  snapshotUpdate = false
+  bail = false
+
+  // Check for daemon commands first
+  if (args[0] === 'daemon') {
+    handleDaemonCommand(args[1] || 'status')
+    return
+  }
+
   // Parse test args
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -882,45 +1099,69 @@ async function runTests() {
   const grep = testNamePatterns.length > 0
     ? testNamePatterns.map(p => `(${p})`).join('|')
     : ''
+  let exitCode = 0
+  let outputBuffer = ''
+  let failureCount = 0
+  let cachePromise = null
+  let retrying = false
+  let jsonResult = null // Parsed JSON from Mocha reporter
+  let startTime = Date.now()
+  let jsonProgress = null
 
   // Check if daemon is running, auto-start if not
-  if (!await isDaemonRunning()) {
-    // Check if server is crashed (serving error page but health check fails)
-    const crashDiagnostics = await getServerCrashDiagnostics()
-    if (crashDiagnostics) {
-      if (jsonMode) {
-        const output = {
-          success: false,
-          error: 'server_crashed',
-          message: crashDiagnostics.error,
-          stack: crashDiagnostics.stack,
-          hint: crashDiagnostics.hint,
-          grep: grep || null,
-          file: filePattern || null,
-          stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+  const daemonStatus = await getDaemonStatus()
+  if (daemonStatus.status !== 'ready') {
+    // Only check for crash diagnostics when daemon is fully down
+    if (daemonStatus.status === 'down') {
+      const crashDiagnostics = await getServerCrashDiagnostics()
+      if (crashDiagnostics) {
+        if (await attemptMongoRecovery('startup', crashDiagnostics)) {
+          return
         }
-        console.log(JSON.stringify(output, null, 2))
-        process.exitCode = 1
-        return
-      } else {
-        console.log(`\n${colors.red}Server crashed:${colors.reset}`)
-        console.log(`${colors.red}${crashDiagnostics.error}${colors.reset}`)
-        if (crashDiagnostics.stack) {
-          console.log(`${colors.dim}${crashDiagnostics.stack.join('\n')}${colors.reset}`)
+        if (jsonMode) {
+          const output = {
+            success: false,
+            error: 'server_crashed',
+            message: crashDiagnostics.error,
+            stack: crashDiagnostics.stack,
+            hint: crashDiagnostics.hint,
+            grep: grep || null,
+            file: filePattern || null,
+            stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+          }
+          console.log(JSON.stringify(output, null, 2))
+          process.exitCode = 1
+          return
+        } else {
+          console.log(`\n${colors.red}Server crashed:${colors.reset}`)
+          console.log(`${colors.red}${crashDiagnostics.error}${colors.reset}`)
+          if (crashDiagnostics.stack) {
+            console.log(`${colors.dim}${crashDiagnostics.stack.join('\n')}${colors.reset}`)
+          }
+          console.log(`\n${colors.yellow}${crashDiagnostics.hint}${colors.reset}\n`)
+          process.exitCode = 1
+          return
         }
-        console.log(`\n${colors.yellow}${crashDiagnostics.hint}${colors.reset}\n`)
-        process.exitCode = 1
-        return
       }
     }
 
     if (!jsonMode) {
-      console.log(`${colors.yellow}Daemon not running, starting fresh (will load latest code)...${colors.reset}\n`)
+      const statusMessage = daemonStatus.status === 'restarting'
+        ? 'Daemon restarting, waiting for it to come back...'
+        : 'Daemon not running, starting fresh (will load latest code)...'
+      console.log(`${colors.yellow}${statusMessage}${colors.reset}\n`)
     }
     const startResult = await startDaemon(jsonMode) // Pass quiet flag for JSON mode
 
     // Handle startup failure
     if (startResult !== true) {
+      const extraMessages = [
+        startResult.message,
+        ...(startResult.logs || []),
+      ].filter(Boolean)
+      if (await attemptMongoRecovery('startup', null, extraMessages)) {
+        return
+      }
       if (jsonMode) {
         const output = {
           success: false,
@@ -966,14 +1207,144 @@ async function runTests() {
     console.log(`\n🧪 Running tests (${desc})${invert ? ' (inverted)' : ''}...\n`)
   }
 
-  let exitCode = 0
-  let outputBuffer = ''
-  let failureCount = 0
-  let cachePromise = null
-  let retrying = false
-  let jsonResult = null // Parsed JSON from Mocha reporter
-  const startTime = Date.now()
-  const testCount = 0 // Track number of tests for progress reporting
+  startTime = Date.now()
+  jsonProgress = jsonMode
+    ? createJsonProgressLogger({ startTime, write: console.error })
+    : null
+  function reportRestartTimeout(context) {
+    const message = context ? `Daemon did not restart (${context})` : 'Daemon did not restart within timeout'
+    const recentLogs = getRecentLogs(10)
+
+    if (jsonMode) {
+      const output = {
+        success: false,
+        error: 'restart_timeout',
+        message,
+        hint: 'Daemon restart timed out. Check daemon logs for the root cause.',
+        grep: grep || null,
+        file: filePattern || null,
+        recent_logs: recentLogs,
+        stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+      }
+      console.log(JSON.stringify(output, null, 2))
+    } else {
+      console.log(`\n${colors.red}${message}${colors.reset}`)
+      if (recentLogs.length > 0) {
+        console.log(`${colors.dim}Recent daemon logs:${colors.reset}`)
+        recentLogs.forEach(line => console.log(`  ${colors.dim}${line}${colors.reset}`))
+      }
+      console.log(`${colors.dim}Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+    }
+    process.exitCode = 1
+  }
+  function reportRestartLoop(context) {
+    const suffix = context ? ` (${context})` : ''
+    const message = `Daemon restarted too frequently${suffix}`
+    const recentLogs = getRecentLogs(10)
+
+    if (jsonMode) {
+      const output = {
+        success: false,
+        error: 'restart_loop',
+        message,
+        hint: 'Daemon keeps restarting. Check daemon logs for OOMs or port conflicts.',
+        grep: grep || null,
+        file: filePattern || null,
+        recent_logs: recentLogs,
+        stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+      }
+      console.log(JSON.stringify(output, null, 2))
+    } else {
+      console.log(`\n${colors.red}${message}${colors.reset}`)
+      if (recentLogs.length > 0) {
+        console.log(`${colors.dim}Recent daemon logs:${colors.reset}`)
+        recentLogs.forEach(line => console.log(`  ${colors.dim}${line}${colors.reset}`))
+      }
+      console.log(`${colors.dim}Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+    }
+    process.exitCode = 1
+  }
+  function shouldAbortRestartLoop(context) {
+    if (!restartLoopTracker.recordRestart()) return false
+    reportRestartLoop(context)
+    return true
+  }
+  async function attemptMongoRecovery(context, crashDiagnostics, extraMessages = []) {
+    const recentLogs = getRecentLogs(15)
+    if (!hasMongoTimeoutEvidence(crashDiagnostics, recentLogs, extraMessages)) {
+      return false
+    }
+
+    const message = `Detected MongoDB server monitor timeout${context ? ` (${context})` : ''}; triggering hot reload...`
+    if (jsonMode) {
+      console.error(`[${Math.round((Date.now() - startTime) / 1000)}s] ${message}`)
+    } else {
+      console.log(`\n${colors.yellow}⚠ ${message}${colors.reset}`)
+    }
+
+    if (shouldAbortRestartLoop('mongo timeout')) {
+      return true
+    }
+
+    retrying = true
+    const hotReload = touchHotReloadFile()
+    if (!hotReload.touched) {
+      if (!jsonMode) {
+        console.log(`${colors.dim}Hot reload touch failed (${hotReload.path}): ${hotReload.error}${colors.reset}`)
+        console.log(`${colors.dim}Falling back to full daemon restart...${colors.reset}`)
+      }
+    } else if (!jsonMode) {
+      console.log(`${colors.dim}Touched ${hotReload.path} to trigger reload${colors.reset}`)
+    }
+
+    if (hotReload.touched) {
+      const restarted = await waitForDaemonRestart({ log: jsonMode ? null : console.log })
+      if (restarted) {
+        runTests()
+        return true
+      }
+      if (!jsonMode) {
+        console.log(`${colors.dim}Hot reload timed out; falling back to full daemon restart...${colors.reset}`)
+      }
+    }
+
+    await stopDaemon(jsonMode)
+    await new Promise(r => setTimeout(r, 1000))
+
+    const startResult = await startDaemon(jsonMode)
+    if (startResult === true) {
+      runTests()
+      return true
+    }
+
+    const failureMessage = startResult.message || 'Daemon failed to restart after Mongo timeout'
+    const failureLogs = startResult.logs && startResult.logs.length > 0
+      ? startResult.logs
+      : recentLogs
+
+    if (jsonMode) {
+      const output = {
+        success: false,
+        error: startResult.error || 'mongo_timeout',
+        message: failureMessage,
+        hint: 'Daemon restart failed after Mongo timeout. Try ./scripts/test-run daemon restart.',
+        grep: grep || null,
+        file: filePattern || null,
+        recent_logs: failureLogs,
+        stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+      }
+      console.log(JSON.stringify(output, null, 2))
+    } else {
+      console.log(`\n${colors.red}${failureMessage}${colors.reset}`)
+      if (failureLogs.length > 0) {
+        console.log(`${colors.dim}Recent daemon logs:${colors.reset}`)
+        failureLogs.forEach(line => console.log(`  ${colors.dim}${line}${colors.reset}`))
+      }
+      console.log(`${colors.dim}Check daemon logs with: ./scripts/test-run daemon logs -t${colors.reset}`)
+    }
+    process.exitCode = 1
+    return true
+  }
 
   function handleEvent(data, setTestsStarted) {
     switch (data.type) {
@@ -993,13 +1364,7 @@ async function runTests() {
           console.log(data.data)
         } else {
           // In JSON mode, output progress to stderr for each test result line
-          // Detect test results: lines with ✓ (pass) or ✗ (fail) or numbered items
-          const line = data.data || ''
-          if (line.includes('✓') || line.includes('✗') || line.match(/^\s*\d+\)/)) {
-            testCount++
-            const elapsed = Math.round((Date.now() - startTime) / 1000)
-            console.error(`[${elapsed}s] ${line.trim()}`)
-          }
+          jsonProgress?.handleLogLine(data.data)
         }
         outputBuffer += data.data + '\n'
         break
@@ -1026,7 +1391,15 @@ async function runTests() {
         }
         retrying = true
         // Wait for daemon to restart and retry
-        waitForDaemonRestart().then(() => runTests())
+        waitForDaemonRestart({ log: jsonMode ? null : console.log }).then((restarted) => {
+          if (restarted) {
+            if (!shouldAbortRestartLoop('shutdown')) {
+              runTests()
+            }
+            return
+          }
+          reportRestartTimeout('restart signal')
+        })
         return // Don't continue processing
 
       case 'json':
@@ -1042,10 +1415,12 @@ async function runTests() {
         exitCode = data.failures > 0 ? 1 : 0
         failureCount = data.failures
 
+        restartLoopTracker.reset()
+
         // Check for no tests matched when a pattern was specified
         const hasPattern = grep || filePattern
-        const testCount = jsonResult?.stats?.tests ?? data.tests ?? 0
-        if (hasPattern && testCount === 0) {
+        const noTestsMatched = shouldReportNoTestsMatched(hasPattern, jsonResult, data)
+        if (noTestsMatched) {
           exitCode = 1 // Treat as error - pattern matched nothing
         }
 
@@ -1053,7 +1428,6 @@ async function runTests() {
           // Output final progress to stderr
           const durationMs = Date.now() - startTime
           const durationSec = Math.round(durationMs / 1000)
-          const noTestsMatched = hasPattern && testCount === 0
           const status = noTestsMatched ? '⚠ NO MATCH' : (data.failures > 0 ? '✗ FAILED' : '✓ PASSED')
           console.error(`[${durationSec}s] ${status} (${data.failures} failures)`)
 
@@ -1079,7 +1453,7 @@ async function runTests() {
           }
           console.log(JSON.stringify(output, null, 2))
         } else {
-          if (hasPattern && testCount === 0) {
+          if (noTestsMatched) {
             console.log(`\n${colors.yellow}⚠ No tests matched pattern: ${grep || filePattern}${colors.reset}`)
             console.log(`${colors.dim}Check the pattern - use -t for test names, file paths for specific files.${colors.reset}\n`)
           } else {
@@ -1130,8 +1504,14 @@ async function runTests() {
             console.log(`\n${colors.yellow}⚠ Daemon restarted during test run, waiting for it to come back...${colors.reset}`)
           }
           // Wait for daemon to come back up, then retry
-          await waitForDaemonRestart()
-          runTests()
+          const restarted = await waitForDaemonRestart({ log: jsonMode ? null : console.log })
+          if (restarted) {
+            if (!shouldAbortRestartLoop('mid-test')) {
+              runTests()
+            }
+          } else {
+            reportRestartTimeout('mid-test')
+          }
           return
         }
       }
@@ -1148,6 +1528,9 @@ async function runTests() {
         if (crashDiagnostics) {
           clearInterval(inactivityCheck)
           req.destroy()
+          if (await attemptMongoRecovery('during tests', crashDiagnostics)) {
+            return
+          }
           if (jsonMode) {
             const output = {
               success: false,
@@ -1247,8 +1630,14 @@ async function runTests() {
       if (watchMode) {
         // Watch mode: wait for daemon restart, then re-run
         console.log(`${colors.cyan}Watching for changes... (Ctrl+C to exit)${colors.reset}`)
-        await waitForDaemonRestart()
-        runTests() // Re-run with same parameters
+        const restarted = await waitForDaemonRestart({ log: jsonMode ? null : console.log })
+        if (restarted) {
+          if (!shouldAbortRestartLoop('watch mode')) {
+            runTests() // Re-run with same parameters
+          }
+        } else {
+          reportRestartTimeout('watch mode')
+        }
       } else {
         // Use exitCode instead of exit() to allow stdout to flush when piped
         process.exitCode = exitCode
@@ -1260,8 +1649,14 @@ async function runTests() {
     if (watchMode && err.code === 'ECONNREFUSED') {
       // Daemon went down - wait for it to come back
       console.log(`${colors.yellow}Daemon stopped, waiting for restart...${colors.reset}`)
-      await waitForDaemonRestart()
-      runTests()
+      const restarted = await waitForDaemonRestart({ log: jsonMode ? null : console.log })
+      if (restarted) {
+        if (!shouldAbortRestartLoop('watch mode')) {
+          runTests()
+        }
+      } else {
+        reportRestartTimeout('watch mode')
+      }
     } else {
       console.error(`${colors.red}Error: ${err.message}${colors.reset}`)
       process.exit(1)
@@ -1272,18 +1667,45 @@ async function runTests() {
 /**
  * Wait for daemon to restart (go down then come back up)
  */
-async function waitForDaemonRestart() {
+async function waitForDaemonRestart(options = {}) {
+  const timeoutMs = options.timeoutMs ?? RESTART_WAIT_TIMEOUT_MS
+  const pollMs = options.pollMs ?? 500
+  const isRunning = options.isRunning ?? isDaemonRunning
+  const log = Object.prototype.hasOwnProperty.call(options, 'log')
+    ? options.log
+    : console.log
+  const startTime = Date.now()
+
   // First wait for daemon to go down (if it's still up)
   let wasDown = false
-  while (true) {
-    const running = await isDaemonRunning()
+  while (Date.now() - startTime < timeoutMs) {
+    const running = await isRunning()
     if (!running) {
       wasDown = true
     } else if (wasDown) {
       // Daemon is back up
-      console.log(`\n${colors.green}Daemon restarted!${colors.reset}\n`)
-      return
+      if (typeof log === 'function') {
+        log(`\n${colors.green}Daemon restarted!${colors.reset}\n`)
+      }
+      return true
     }
-    await new Promise(r => setTimeout(r, 500))
+    await new Promise(r => setTimeout(r, pollMs))
   }
+
+  return false
+}
+
+if (require.main === module) {
+  main()
+}
+
+module.exports = {
+  main,
+  createJsonProgressLogger,
+  createRestartLoopTracker,
+  shouldReportNoTestsMatched,
+  parseDaemonHealthResponse,
+  isMongoTimeoutMessage,
+  touchHotReloadFile,
+  waitForDaemonRestart,
 }
