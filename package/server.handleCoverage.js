@@ -8,17 +8,17 @@ import { fetch } from 'meteor/fetch';
  * @return {Promise<any>}
  */
 const request = async ({ url, message }) => {
-  let response;
+  const response = await fetch(Meteor.absoluteUrl(url));
+  const text = await response.text();
   let data;
   try {
-    response = await fetch(Meteor.absoluteUrl(url));
-    data = await response.json();
-  } catch (error) {
-    throw new Error(`${message} ${error.message}`);
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`${message} Invalid JSON response`);
   }
 
   if (response?.status !== 200) {
-    throw new Error(`${message} ${response?.status} ${data}`);
+    throw new Error(`${message} ${response?.status} ${JSON.stringify(data)}`);
   }
 
   return data;
