@@ -403,20 +403,26 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
   // Buffer for JSON reporter output (collected and sent at end)
   let jsonBuffer = '';
 
-  const sendLog = (data) => {
+  const sendEvent = (payload) => {
     try {
-      res.write(`data: ${JSON.stringify({ type: 'log', data })}\n\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
     } catch (e) {
       // Connection closed
     }
   };
 
+  const sendLog = (data) => {
+    sendEvent({ type: 'log', data });
+  };
+
   const sendError = (data) => {
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', data })}\n\n`);
-    } catch (e) {
-      // Connection closed
-    }
+    sendEvent({ type: 'error', data });
+  };
+
+  const sendTest = (test) => {
+    const title = typeof test?.fullTitle === 'function' ? test.fullTitle() : test?.title;
+    const payload = title ? { type: 'test', title } : { type: 'test' };
+    sendEvent(payload);
   };
 
   process.stdout.write = (chunk, encoding, callback) => {
@@ -460,7 +466,7 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     }
   }, 10000);
 
-  mochaInstance.run(async (failureCount) => {
+  const runner = mochaInstance.run(async (failureCount) => {
     clearInterval(heartbeat);
 
     // Reset all collections after tests complete to prevent inter-run pollution
@@ -500,6 +506,10 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
         // Connection closed
       }
     }
+  });
+
+  runner.on('test end', (test) => {
+    sendTest(test);
   });
 }
 

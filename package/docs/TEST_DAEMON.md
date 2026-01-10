@@ -50,6 +50,12 @@ This avoids the ~90 second cold start for each test run.
 | `-g, --grep <pattern>` | Alias for `-t` |
 | `-f, --file <path>` | Run tests in specific file |
 | `-i, --invert` | Invert pattern match (exclude instead of include) |
+| `-w, --watch` | Watch mode: re-run on daemon restart |
+| `--json` | Output results as JSON |
+| `--llm` | Output compact LLM-friendly summary |
+| `-u, --snapshot-update` | Update snapshots (sets SNAPSHOT_UPDATE=1) |
+| `-b, --bail` | Stop on first test failure |
+| `--no-cache` | Force run, skip cache check |
 | `-h, --help` | Show help |
 
 ### Examples
@@ -75,6 +81,9 @@ This avoids the ~90 second cold start for each test run.
 
 # File + grep filter
 ./scripts/test-run FullSync.app-spec.ts -t "clears data"
+
+# LLM-friendly summary output
+./scripts/test-run --llm
 ```
 
 ### File Path Detection

@@ -13,6 +13,7 @@ process.removeAllListeners('warning')
  *   ./scripts/test-run -t Calendar -t sync # Multiple patterns (OR)
  *   ./scripts/test-run Calendar -i        # Exclude pattern
  *   ./scripts/test-run --json             # JSON output for LLM/scripting
+ *   ./scripts/test-run --llm              # LLM-friendly summary output
  *   ./scripts/test-run Calendar --json    # Filtered tests with JSON output
  *   ./scripts/test-run daemon start       # Start daemon explicitly
  *   ./scripts/test-run daemon stop        # Stop daemon
@@ -584,6 +585,134 @@ function shouldReportNoTestsMatched(hasPattern, jsonResult, data) {
   return hasPattern && testCount === 0
 }
 
+const DEFAULT_LLM_FAILURE_LIMIT = 10
+const DEFAULT_LLM_STACK_LINES = 6
+
+function summarizeFailures(failures, options = {}) {
+  if (!Array.isArray(failures)) {
+    return { total: 0, items: [], truncated: false }
+  }
+
+  const limit = Number.isFinite(options.limit) ? options.limit : DEFAULT_LLM_FAILURE_LIMIT
+  const stackLines = Number.isFinite(options.stackLines) ? options.stackLines : DEFAULT_LLM_STACK_LINES
+  const items = failures.slice(0, limit).map((failure) => {
+    const fullTitle = typeof failure?.fullTitle === 'string' ? failure.fullTitle : undefined
+    const title = typeof failure?.title === 'string' ? failure.title : undefined
+    const err = failure?.err
+    const message = typeof err?.message === 'string'
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : undefined
+    const stack = typeof err?.stack === 'string'
+      ? err.stack.split('\n').slice(0, stackLines)
+      : undefined
+
+    return {
+      title: fullTitle || title || 'Unknown test',
+      file: typeof failure?.file === 'string' ? failure.file : undefined,
+      duration_ms: typeof failure?.duration === 'number' ? failure.duration : undefined,
+      message,
+      stack,
+    }
+  })
+
+  return {
+    total: failures.length,
+    items,
+    truncated: failures.length > items.length,
+  }
+}
+
+function buildLlmSummary(output, failureSummary) {
+  const lines = []
+  const status = output?.success === true
+    ? 'passed'
+    : output?.success === false
+      ? 'failed'
+      : 'unknown'
+  const statusSuffix = output?.error ? ` (${output.error})` : ''
+
+  lines.push(`status: ${status}${statusSuffix}`)
+
+  if (output?.cached) {
+    const age = Number.isFinite(output.cached_age_seconds)
+      ? ` (${output.cached_age_seconds}s)`
+      : ''
+    lines.push(`cached: true${age}`)
+  }
+
+  if (typeof output?.duration_ms === 'number') {
+    lines.push(`duration_ms: ${output.duration_ms}`)
+  }
+
+  const filterParts = []
+  if (output?.file) filterParts.push(`file=${output.file}`)
+  if (output?.grep) filterParts.push(`grep=${output.grep}`)
+  if (output?.invert) filterParts.push('invert=1')
+  if (filterParts.length > 0) {
+    lines.push(`filter: ${filterParts.join(' ')}`)
+  }
+
+  const stats = output?.stats
+  if (stats && typeof stats.tests === 'number') {
+    const passes = typeof stats.passes === 'number' ? stats.passes : 0
+    const failures = typeof stats.failures === 'number' ? stats.failures : 0
+    const pending = typeof stats.pending === 'number' ? stats.pending : 0
+    lines.push(`tests: ${stats.tests} (passes ${passes}, failures ${failures}, pending ${pending})`)
+  }
+
+  if (output?.message) lines.push(`message: ${output.message}`)
+  if (output?.hint) lines.push(`hint: ${output.hint}`)
+
+  if (failureSummary?.items?.length) {
+    lines.push('failures:')
+    for (const failure of failureSummary.items) {
+      const location = failure.file ? ` (${failure.file})` : ''
+      const detail = failure.message ? ` - ${failure.message}` : ''
+      lines.push(`- ${failure.title}${location}${detail}`)
+    }
+    if (failureSummary.truncated) {
+      const remaining = failureSummary.total - failureSummary.items.length
+      lines.push(`... ${remaining} more failures omitted`)
+    }
+  }
+
+  return lines.join('\n')
+}
+
+function finalizeJsonOutput(output, options = {}) {
+  const failureSummary = summarizeFailures(output.failures, options)
+  const summary = buildLlmSummary(output, failureSummary)
+
+  return {
+    ...output,
+    llm_summary: summary,
+    llm_failures: failureSummary.items,
+    llm_failures_total: failureSummary.total,
+    llm_failures_truncated: failureSummary.truncated,
+  }
+}
+
+function formatMachineOutput(output, options = {}) {
+  const mode = options.mode ?? 'json'
+  const formatted = finalizeJsonOutput(output, options)
+  if (mode === 'llm') {
+    return formatted.llm_summary
+  }
+  return JSON.stringify(formatted, null, 2)
+}
+
+function printMachineOutput(output, options = {}) {
+  const mode = llmMode ? 'llm' : 'json'
+  console.log(formatMachineOutput(output, { ...options, mode }))
+}
+
+function isActivityEvent(data) {
+  if (!data || typeof data.type !== 'string') return false
+  return data.type !== 'heartbeat'
+}
+
 async function waitForLockOrDaemon(quiet = false) {
   const startTime = Date.now()
   const maxWait = 180000 // 3 minutes max wait
@@ -918,6 +1047,7 @@ let filePattern = ''
 let invert = false
 let watchMode = false
 let jsonMode = false
+let llmMode = false
 let snapshotUpdate = false
 let bail = false
 
@@ -987,6 +1117,10 @@ function main(argv = process.argv.slice(2)) {
     else if (arg === '--json') {
       jsonMode = true
     }
+    // LLM output mode (compact text summary)
+    else if (arg === '--llm') {
+      llmMode = true
+    }
     // Snapshot update mode
     else if (arg === '--snapshot-update' || arg === '-u') {
       snapshotUpdate = true
@@ -1008,6 +1142,7 @@ Options:
   -i, --invert                     Invert pattern match
   -w, --watch                      Watch mode: re-run on daemon restart
   --json                           Output results as JSON (for LLM/scripting)
+  --llm                            Output compact text summary optimized for LLMs
   -u, --snapshot-update            Update snapshots (sets SNAPSHOT_UPDATE=1)
   -b, --bail                       Stop on first test failure
   --no-cache                       Force run, skip cache check
@@ -1034,6 +1169,7 @@ Examples:
   test-run FullSync.app-spec.ts -t "clears"     File + grep filter
   test-run Calendar -w                          Watch mode: re-run on changes
   test-run --json                               JSON output for LLM consumption
+  test-run --llm                                Compact LLM-friendly output
   test-run Calendar --json | jq '.stats'        Filter JSON with jq
   test-run daemon stop                          Stop the daemon
 `)
@@ -1047,6 +1183,10 @@ Examples:
         testNamePatterns.push(arg)
       }
     }
+  }
+
+  if (llmMode) {
+    jsonMode = true
   }
 
   // Run tests
@@ -1081,7 +1221,7 @@ async function runTests() {
             hint: 'Cached result. File changes are auto-detected - just re-run to get fresh results.',
             ...cached.jsonResult,
           }
-          console.log(JSON.stringify(output, null, 2))
+          printMachineOutput(output)
           process.exitCode = cached.exitCode
           return
         }
@@ -1129,7 +1269,7 @@ async function runTests() {
             file: filePattern || null,
             stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
           }
-          console.log(JSON.stringify(output, null, 2))
+          printMachineOutput(output)
           process.exitCode = 1
           return
         } else {
@@ -1173,7 +1313,7 @@ async function runTests() {
           file: filePattern || null,
           stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
         }
-        console.log(JSON.stringify(output, null, 2))
+        printMachineOutput(output)
       }
       process.exitCode = 1
       return
@@ -1226,7 +1366,7 @@ async function runTests() {
         recent_logs: recentLogs,
         stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
       }
-      console.log(JSON.stringify(output, null, 2))
+      printMachineOutput(output)
     } else {
       console.log(`\n${colors.red}${message}${colors.reset}`)
       if (recentLogs.length > 0) {
@@ -1253,7 +1393,7 @@ async function runTests() {
         recent_logs: recentLogs,
         stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
       }
-      console.log(JSON.stringify(output, null, 2))
+      printMachineOutput(output)
     } else {
       console.log(`\n${colors.red}${message}${colors.reset}`)
       if (recentLogs.length > 0) {
@@ -1333,7 +1473,7 @@ async function runTests() {
         recent_logs: failureLogs,
         stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
       }
-      console.log(JSON.stringify(output, null, 2))
+      printMachineOutput(output)
     } else {
       console.log(`\n${colors.red}${failureMessage}${colors.reset}`)
       if (failureLogs.length > 0) {
@@ -1451,7 +1591,7 @@ async function runTests() {
             stats: defaultStats,
             ...(jsonResult || {}),
           }
-          console.log(JSON.stringify(output, null, 2))
+          printMachineOutput(output)
         } else {
           if (noTestsMatched) {
             console.log(`\n${colors.yellow}⚠ No tests matched pattern: ${grep || filePattern}${colors.reset}`)
@@ -1532,19 +1672,19 @@ async function runTests() {
             return
           }
           if (jsonMode) {
-            const output = {
-              success: false,
-              error: 'server_crashed',
-              message: crashDiagnostics.error,
-              stack: crashDiagnostics.stack,
-              hint: crashDiagnostics.hint,
-              grep: grep || null,
-              file: filePattern || null,
-              stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
-            }
-            console.log(JSON.stringify(output, null, 2))
-            process.exitCode = 1
-          } else {
+          const output = {
+            success: false,
+            error: 'server_crashed',
+            message: crashDiagnostics.error,
+            stack: crashDiagnostics.stack,
+            hint: crashDiagnostics.hint,
+            grep: grep || null,
+            file: filePattern || null,
+            stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+          }
+          printMachineOutput(output)
+          process.exitCode = 1
+        } else {
             console.log(`\n${colors.red}Server crashed during tests:${colors.reset}`)
             console.log(`${colors.red}${crashDiagnostics.error}${colors.reset}`)
             if (crashDiagnostics.stack) {
@@ -1574,7 +1714,7 @@ async function runTests() {
             recent_logs: recentLogs,
             stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
           }
-          console.log(JSON.stringify(output, null, 2))
+          printMachineOutput(output)
           process.exitCode = 1
         } else {
           if (testsStarted) {
@@ -1605,7 +1745,7 @@ async function runTests() {
             const data = JSON.parse(line.slice(6))
             // Only reset activity timer on actual test output, not heartbeats
             // This way we detect hung tests even if connection is alive
-            if (data.type !== 'heartbeat') {
+            if (isActivityEvent(data)) {
               lastActivity = Date.now()
             }
             handleEvent(data, () => { testsStarted = true })
@@ -1704,6 +1844,12 @@ module.exports = {
   createJsonProgressLogger,
   createRestartLoopTracker,
   shouldReportNoTestsMatched,
+  summarizeFailures,
+  buildLlmSummary,
+  finalizeJsonOutput,
+  formatMachineOutput,
+  printMachineOutput,
+  isActivityEvent,
   parseDaemonHealthResponse,
   isMongoTimeoutMessage,
   touchHotReloadFile,
