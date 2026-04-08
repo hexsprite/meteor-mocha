@@ -755,6 +755,69 @@ async function waitForLockOrDaemon(quiet = false) {
   return { timeout: true }
 }
 
+// Maximum number of daemon startup attempts before giving up. Rspack and
+// meteor-tool have a known flakiness where the build subprocess can crash
+// during cold starts (processes.js onExit bug, OOM pressure, etc). Without
+// retries, a single flaky crash burns the entire test run. With 3 attempts,
+// transient flakes become slightly-slower-but-successful runs.
+const MAX_DAEMON_STARTUP_ATTEMPTS = 3
+
+/**
+ * Structured event logger for daemon lifecycle diagnostics.
+ *
+ * Writes a JSON line to the daemon log file, tagged with a wall-clock ISO
+ * timestamp and monotonic elapsed-ms counter. Also echoes to stderr when
+ * not in quiet/JSON mode so operators can watch events live.
+ *
+ * Verbosity is intentionally high: daemon startup flakes are rare in any
+ * single run but very expensive when they happen (they time out an entire
+ * test iteration). Having per-phase structured events means a single
+ * failed run's log is self-diagnosing, without needing to reproduce.
+ */
+let _daemonLogEpoch = null
+function logDaemonEvent(event, data = {}, { quiet = false } = {}) {
+  if (_daemonLogEpoch === null) _daemonLogEpoch = Date.now()
+  const elapsedMs = Date.now() - _daemonLogEpoch
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    elapsed_ms: elapsedMs,
+    event,
+    ...data,
+  })
+  try {
+    fs.appendFileSync(logFile, `[daemon-event] ${line}\n`)
+  } catch {
+    // Best-effort — never let diagnostic logging crash the daemon.
+  }
+  if (!quiet) {
+    process.stderr.write(`${colors.dim}[daemon-event] ${line}${colors.reset}\n`)
+  }
+}
+
+/**
+ * Snapshot relevant system state at a phase boundary. Used to capture
+ * what was happening around a daemon crash or timeout, so the failure
+ * is diagnosable from log artifacts alone.
+ */
+function captureDiagnosticSnapshot(label, daemonPid) {
+  const snapshot = { label }
+  try {
+    snapshot.port_bound_by = execSync(`lsof -ti:${port} 2>/dev/null || true`).toString().trim()
+  } catch { snapshot.port_bound_by = 'unknown' }
+  try {
+    snapshot.daemon_pid_alive = daemonPid ? isProcessRunning(daemonPid) : null
+  } catch { snapshot.daemon_pid_alive = 'unknown' }
+  try {
+    snapshot.meteor_procs = execSync(`pgrep -lf "meteor|rspack|mongod" 2>/dev/null || true`)
+      .toString().trim().split('\n').filter(Boolean).slice(0, 20)
+  } catch { snapshot.meteor_procs = [] }
+  try {
+    const stat = fs.statSync(path.join(process.cwd(), '.meteor', 'local'))
+    snapshot.dotmeteor_local_mtime = stat.mtime.toISOString()
+  } catch { snapshot.dotmeteor_local_mtime = null }
+  return snapshot
+}
+
 // Start daemon in background
 async function startDaemon(quiet = false) {
   // Check if already running
@@ -795,112 +858,196 @@ async function startDaemon(quiet = false) {
 
   // We have the lock - we're responsible for starting the daemon
   try {
-    // Check if stale PID file
-    const existingPid = readPid()
-    if (existingPid && !isProcessRunning(existingPid)) {
-      if (!quiet) console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
-      removePid()
-    }
-
-    if (!quiet) console.log(`${colors.cyan}Starting test daemon...${colors.reset}`)
-
-    // Ensure log directory exists
+    // Ensure log directory exists once (shared across all attempts)
     const logDir = path.dirname(logFile)
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true })
     }
 
-    // Start daemon in background
-    const out = fs.openSync(logFile, 'a')
-    const err = fs.openSync(logFile, 'a')
+    logDaemonEvent('startup-begin', {
+      pid_file: pidFile,
+      log_file: logFile,
+      port,
+      max_attempts: MAX_DAEMON_STARTUP_ATTEMPTS,
+      pre_state: captureDiagnosticSnapshot('pre-startup', null),
+    }, { quiet })
 
-    const child = spawn('npm', ['run', 'test:daemon'], {
-      detached: true,
-      stdio: ['ignore', out, err],
-      cwd: process.cwd(),
-    })
-
-    writePid(child.pid)
-    child.unref()
-
-    if (!quiet) {
-      console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
-      console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
-    }
-
-    // Start tailing log file to show startup progress/errors (skip in quiet mode)
-    const tailer = quiet ? null : tailLogFile()
-    if (tailer) tailer.start()
-
-    // Wait for daemon to be ready
-    if (!quiet) console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
-    const startTime = Date.now()
-    const timeout = 120000 // 2 minutes
-    const daemonPid = child.pid
-
-    while (Date.now() - startTime < timeout) {
-      // Check if daemon process crashed (exited early)
-      if (!isProcessRunning(daemonPid)) {
-        if (tailer) tailer.stop()
-
-        // Process died - extract error from logs immediately
-        const recentLogs = getRecentLogs(30)
-        const errorLines = recentLogs.filter(isDaemonErrorLine)
-
-        if (!quiet) {
-          console.error(`\n${colors.red}Daemon crashed during startup${colors.reset}`)
-          if (errorLines.length > 0) {
-            console.error(`${colors.red}Error:${colors.reset}`)
-            errorLines.slice(-5).forEach(line => console.error(`  ${colors.red}${line}${colors.reset}`))
-          }
-          console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
-        }
-
-        cleanupFailedStart(daemonPid)
-        releaseLock()
-        return {
-          started: false,
-          error: 'daemon_crashed',
-          message: errorLines.length > 0 ? errorLines.slice(-1)[0] : 'Daemon crashed during startup',
-          logs: errorLines.slice(-10),
-        }
+    // Retry loop: rspack/meteor flakes on cold start get a second chance
+    // before we give up and report failure to the caller.
+    let lastFailure = null
+    for (let attempt = 1; attempt <= MAX_DAEMON_STARTUP_ATTEMPTS; attempt++) {
+      // Clean up stale PID file from a prior attempt or crashed process
+      const existingPid = readPid()
+      if (existingPid && !isProcessRunning(existingPid)) {
+        if (!quiet) console.log(`${colors.dim}Cleaning up stale PID file${colors.reset}`)
+        logDaemonEvent('stale-pid-cleanup', { attempt, stale_pid: existingPid }, { quiet })
+        removePid()
       }
 
-      if (await isDaemonRunning()) {
-        // Give Meteor a moment to fully settle after health check passes
-        // This prevents race conditions where /test/run isn't quite ready yet
-        await new Promise(r => setTimeout(r, 500))
-        if (tailer) tailer.stop()
+      if (!quiet) {
+        const label = attempt === 1
+          ? 'Starting test daemon...'
+          : `Starting test daemon (attempt ${attempt}/${MAX_DAEMON_STARTUP_ATTEMPTS})...`
+        console.log(`${colors.cyan}${label}${colors.reset}`)
+      }
+
+      // Start daemon in background
+      const out = fs.openSync(logFile, 'a')
+      const err = fs.openSync(logFile, 'a')
+
+      const child = spawn('npm', ['run', 'test:daemon'], {
+        detached: true,
+        stdio: ['ignore', out, err],
+        cwd: process.cwd(),
+      })
+
+      writePid(child.pid)
+      child.unref()
+
+      logDaemonEvent('spawn', {
+        attempt,
+        child_pid: child.pid,
+        cmd: 'npm run test:daemon',
+      }, { quiet })
+
+      if (!quiet) {
+        console.log(`${colors.dim}Daemon PID: ${child.pid}${colors.reset}`)
+        console.log(`${colors.dim}Log file: ${logFile}${colors.reset}`)
+      }
+
+      // Tail the log (unless in JSON/quiet mode). Create a fresh tailer
+      // per attempt so we don't miss any startup output.
+      const tailer = quiet ? null : tailLogFile()
+      if (tailer) tailer.start()
+
+      if (!quiet) console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
+      const startTime = Date.now()
+      const timeout = 120000 // 2 minutes per attempt
+      const daemonPid = child.pid
+      let pollTick = 0
+      let lastPhase = 'spawned'
+      let result = null // one of 'ready' | 'crashed' | 'timeout'
+
+      while (Date.now() - startTime < timeout) {
+        pollTick++
+        const elapsedMs = Date.now() - startTime
+
+        // Emit a heartbeat every ~10s so we know the poller is alive
+        // and can see roughly where in the startup we got stuck.
+        if (pollTick % 5 === 0) {
+          logDaemonEvent('startup-poll-tick', {
+            attempt,
+            poll_tick: pollTick,
+            elapsed_ms: elapsedMs,
+            phase: lastPhase,
+          }, { quiet })
+        }
+
+        // Process died mid-startup — typical rspack/processes.js crash
+        if (!isProcessRunning(daemonPid)) {
+          result = 'crashed'
+          break
+        }
+
+        if (await isDaemonRunning()) {
+          // Health check passed; give meteor a moment to settle.
+          await new Promise(r => setTimeout(r, 500))
+          result = 'ready'
+          break
+        }
+        lastPhase = 'polling-health'
+        await new Promise(r => setTimeout(r, 2000))
+      }
+
+      if (tailer) tailer.stop()
+
+      // ── Success path ────────────────────────────────────────────
+      if (result === 'ready') {
+        logDaemonEvent('startup-ready', {
+          attempt,
+          daemon_pid: daemonPid,
+          elapsed_ms: Date.now() - startTime,
+          poll_ticks: pollTick,
+        }, { quiet })
         if (!quiet) console.log(`\n${colors.green}Daemon ready with latest code!${colors.reset}\n`)
         releaseLock()
         return true
       }
-      await new Promise(r => setTimeout(r, 2000))
-    }
 
-    if (tailer) tailer.stop()
+      // ── Failure paths — gather diagnostics then decide on retry ─
+      const recentLogs = getRecentLogs(50)
+      const errorLines = recentLogs.filter(isDaemonErrorLine)
+      const failureSnapshot = captureDiagnosticSnapshot(
+        result === 'crashed' ? 'post-crash' : 'post-timeout',
+        daemonPid,
+      )
 
-    // Extract error from log file for better diagnostics
-    const recentLogs = getRecentLogs(30)
-    const errorLines = recentLogs.filter(isDaemonErrorLine)
+      logDaemonEvent(
+        result === 'crashed' ? 'daemon-crashed' : 'startup-timeout',
+        {
+          attempt,
+          daemon_pid: daemonPid,
+          elapsed_ms: Date.now() - startTime,
+          poll_ticks: pollTick,
+          error_lines: errorLines.slice(-5),
+          snapshot: failureSnapshot,
+        },
+        { quiet },
+      )
 
-    if (!quiet) {
-      console.error(`\n${colors.red}Daemon failed to start within ${timeout / 1000}s${colors.reset}`)
-      if (errorLines.length > 0) {
-        console.error(`\n${colors.red}Error from logs:${colors.reset}`)
-        errorLines.slice(-5).forEach(line => console.error(`  ${colors.red}${line}${colors.reset}`))
+      cleanupFailedStart(daemonPid)
+      lastFailure = {
+        started: false,
+        error: result === 'crashed' ? 'daemon_crashed' : 'startup_timeout',
+        message: errorLines.length > 0
+          ? errorLines.slice(-1)[0]
+          : `Daemon ${result === 'crashed' ? 'crashed during startup' : 'failed to start within timeout'}`,
+        logs: errorLines.slice(-10),
       }
-      console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
+
+      // ── Retry decision ──────────────────────────────────────────
+      if (attempt < MAX_DAEMON_STARTUP_ATTEMPTS) {
+        logDaemonEvent('will-retry', {
+          attempt,
+          next_attempt: attempt + 1,
+          reason: lastFailure.error,
+          backoff_ms: 2000,
+        }, { quiet })
+        if (!quiet) {
+          console.log(
+            `\n${colors.yellow}Daemon ${result === 'crashed' ? 'crashed' : 'timed out'} on attempt ${attempt}/${MAX_DAEMON_STARTUP_ATTEMPTS}; retrying in 2s...${colors.reset}`,
+          )
+        }
+        await new Promise(r => setTimeout(r, 2000))
+        continue
+      }
+
+      // ── Out of retries — surface the failure to the caller ──────
+      if (!quiet) {
+        console.error(
+          `\n${colors.red}Daemon failed after ${MAX_DAEMON_STARTUP_ATTEMPTS} attempts (${lastFailure.error})${colors.reset}`,
+        )
+        if (errorLines.length > 0) {
+          console.error(`${colors.red}Error:${colors.reset}`)
+          errorLines.slice(-5).forEach(line =>
+            console.error(`  ${colors.red}${line}${colors.reset}`),
+          )
+        }
+        console.error(`\n${colors.dim}Full logs: ${logFile}${colors.reset}`)
+      }
+
+      logDaemonEvent('startup-abandoned', {
+        total_attempts: MAX_DAEMON_STARTUP_ATTEMPTS,
+        final_error: lastFailure.error,
+      }, { quiet })
+
+      releaseLock()
+      return lastFailure
     }
 
-    cleanupFailedStart(daemonPid)
+    // Unreachable — the for-loop always returns or assigns lastFailure
     releaseLock()
-    return {
-      started: false,
-      error: 'startup_timeout',
-      message: errorLines.length > 0 ? errorLines.slice(-1)[0] : 'Daemon failed to start within timeout',
-      logs: errorLines.slice(-10),
-    }
+    return lastFailure
   } catch (err) {
     releaseLock()
     throw err
