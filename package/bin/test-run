@@ -1678,7 +1678,15 @@ async function runTests() {
         // If it's a hot reload, the mid-test inactivity check will see the
         // daemon come back and the user can just re-run.
         const reason = data.reason || 'unknown'
-        const message = `Test daemon shut down (${reason}) — exiting.`
+        // Map known reason strings to friendlier UX text. Unknown reasons
+        // fall through verbatim so operators can still debug them.
+        const friendly = (() => {
+          if (reason === 'SIGTERM' || reason === 'SIGINT') return 'daemon was stopped'
+          if (reason === 'already-shutting-down') return 'daemon is shutting down'
+          if (typeof reason === 'string' && reason.startsWith('uncaughtException')) return 'daemon crashed'
+          return reason
+        })()
+        const message = `Test daemon shut down (${friendly}) — exiting.`
         retrying = true // Suppress the normal end-of-stream exit path
         if (jsonMode) {
           console.error(`[${Math.round((Date.now() - startTime) / 1000)}s] ${message}`)

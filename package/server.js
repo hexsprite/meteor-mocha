@@ -9,6 +9,7 @@ import fs from 'node:fs';
 
 import setArgs from './runtimeArgs';
 import handleCoverage from './server.handleCoverage';
+import { broadcastShutdown } from './shutdownBroadcast';
 
 let mochaOptions;
 let runnerOptions;
@@ -307,38 +308,62 @@ let shuttingDown = false;
 // Track active SSE connections for graceful shutdown
 const activeConnections = new Set();
 
-// Graceful shutdown: notify all connected clients before daemon exits
+// Graceful shutdown: notify all connected clients before daemon exits.
+// The broadcast itself lives in shutdownBroadcast.js so it can be unit-tested
+// without booting a Meteor server — see tests/unit/shutdownBroadcast.test.mjs.
 function setupShutdownHandlers() {
-  const shutdown = (reason, { exit = true } = {}) => {
+  const shutdown = (reason, exitCode) => {
     if (shuttingDown) return; // Prevent double-handling
     shuttingDown = true;
-    console.log(`[daemon] Shutting down (${reason}), notifying ${activeConnections.size} client(s)...`);
+    const connCount = activeConnections.size;
+    console.log(`[daemon] Shutting down (${reason}), notifying ${connCount} client(s)...`);
 
-    // Broadcast to all active SSE connections simultaneously
-    for (const res of activeConnections) {
-      try {
-        res.write(`data: ${JSON.stringify({ type: 'daemon-shutdown', reason })}\n\n`);
-        res.end();
-      } catch (e) {
-        // Connection may already be closed
-      }
-    }
+    // Snapshot and clear synchronously so new requests during shutdown see an
+    // empty set (and hit the `shuttingDown` rejection path in runDaemonTests).
+    const conns = Array.from(activeConnections);
     activeConnections.clear();
 
-    if (exit) {
-      // Give the SSE writes a moment to flush over the socket, then exit.
-      // Keep this short so `daemon stop` stays snappy (~1s budget from the issue).
-      setTimeout(() => process.exit(0), 150).unref();
+    // Broadcast returns a promise that resolves once sockets have flushed OR
+    // a hard timeout fires. Either way we exit promptly — the upper bound
+    // keeps `daemon stop` snappy even if a client socket is wedged.
+    let finalized = false;
+    const finalize = () => {
+      if (finalized) return;
+      finalized = true;
+      process.exit(exitCode);
+    };
+
+    // Outer try/catch is important for the uncaughtException path: we can
+    // never let the shutdown handler itself throw, or the daemon would hang
+    // instead of exiting.
+    try {
+      broadcastShutdown({ connections: conns, reason, hardTimeoutMs: 1000 })
+        .then((result) => {
+          if (result.timedOut) {
+            console.log(`[daemon] Shutdown broadcast timed out after flushing ${result.drained}/${result.notified} client(s)`);
+          }
+          finalize();
+        })
+        .catch((err) => {
+          console.error('[daemon] broadcastShutdown rejected unexpectedly:', err);
+          finalize();
+        });
+    } catch (e) {
+      console.error('[daemon] broadcastShutdown threw synchronously:', e);
+      finalize();
     }
+
+    // Absolute safety net: even if `broadcastShutdown` somehow never settles,
+    // force-exit after the hard timeout + a small slack window.
+    const safetyNet = setTimeout(finalize, 1500);
+    if (typeof safetyNet.unref === 'function') safetyNet.unref();
   };
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+  process.on('SIGINT', () => shutdown('SIGINT', 0));
   process.on('uncaughtException', (err) => {
     console.error('[daemon] Uncaught exception, notifying clients and exiting:', err);
-    shutdown(`uncaughtException: ${err.message}`, { exit: false });
-    // Exit with a non-zero code so the supervisor knows this wasn't clean.
-    setTimeout(() => process.exit(1), 150).unref();
+    shutdown(`uncaughtException: ${err && err.message}`, 1);
   });
 }
 

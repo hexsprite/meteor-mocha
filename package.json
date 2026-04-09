@@ -11,6 +11,7 @@
     "lint:fix": "node_modules/@biomejs/biome/bin/biome lint --write ./package",
     "format": "node_modules/@biomejs/biome/bin/biome format ./package",
     "format:fix": "node_modules/@biomejs/biome/bin/biome format --write ./package",
+    "test:unit": "node --test tests/unit/*.test.mjs",
     "publish": "cd package && semantic-release"
   },
   "author": "Dispatch Technologies, Inc. (https://www.dispatch.me/)",
