@@ -1671,23 +1671,32 @@ async function runTests() {
         outputBuffer += data.data + '\n'
         break
 
-      case 'shutdown':
-        // Server is shutting down (hot reload), wait and retry
-        if (!jsonMode) {
-          console.log(`\n${colors.yellow}⚠ Server restarting (${data.reason}), waiting for daemon to come back...${colors.reset}`)
-        }
-        retrying = true
-        // Wait for daemon to restart and retry
-        waitForDaemonRestart({ log: jsonMode ? null : console.log }).then((restarted) => {
-          if (restarted) {
-            if (!shouldAbortRestartLoop('shutdown')) {
-              runTests()
-            }
-            return
+      case 'daemon-shutdown':
+      case 'shutdown': {
+        // Daemon is going away (explicit stop, crash, or signal). Bail out
+        // cleanly rather than hanging waiting for a restart that may never come.
+        // If it's a hot reload, the mid-test inactivity check will see the
+        // daemon come back and the user can just re-run.
+        const reason = data.reason || 'unknown'
+        const message = `Test daemon shut down (${reason}) — exiting.`
+        retrying = true // Suppress the normal end-of-stream exit path
+        if (jsonMode) {
+          console.error(`[${Math.round((Date.now() - startTime) / 1000)}s] ${message}`)
+          const output = {
+            success: false,
+            error: 'daemon_shutdown',
+            message,
+            reason,
+            grep: grep || null,
+            file: filePattern || null,
+            stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
           }
-          reportRestartTimeout('restart signal')
-        })
-        return // Don't continue processing
+          printMachineOutput(output)
+        } else {
+          console.log(`\n${colors.red}${message}${colors.reset}`)
+        }
+        process.exit(2)
+      }
 
       case 'json':
         // Mocha JSON reporter output

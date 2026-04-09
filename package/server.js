@@ -307,27 +307,39 @@ let shuttingDown = false;
 // Track active SSE connections for graceful shutdown
 const activeConnections = new Set();
 
-// Graceful shutdown: notify all connected clients before server restarts
+// Graceful shutdown: notify all connected clients before daemon exits
 function setupShutdownHandlers() {
-  const shutdown = (signal) => {
+  const shutdown = (reason, { exit = true } = {}) => {
     if (shuttingDown) return; // Prevent double-handling
     shuttingDown = true;
-    console.log(`[daemon] Received ${signal}, notifying clients...`);
+    console.log(`[daemon] Shutting down (${reason}), notifying ${activeConnections.size} client(s)...`);
 
-    // Notify all active SSE connections
+    // Broadcast to all active SSE connections simultaneously
     for (const res of activeConnections) {
       try {
-        res.write(`data: ${JSON.stringify({ type: 'shutdown', reason: signal })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'daemon-shutdown', reason })}\n\n`);
         res.end();
       } catch (e) {
         // Connection may already be closed
       }
     }
     activeConnections.clear();
+
+    if (exit) {
+      // Give the SSE writes a moment to flush over the socket, then exit.
+      // Keep this short so `daemon stop` stays snappy (~1s budget from the issue).
+      setTimeout(() => process.exit(0), 150).unref();
+    }
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('uncaughtException', (err) => {
+    console.error('[daemon] Uncaught exception, notifying clients and exiting:', err);
+    shutdown(`uncaughtException: ${err.message}`, { exit: false });
+    // Exit with a non-zero code so the supervisor knows this wasn't clean.
+    setTimeout(() => process.exit(1), 150).unref();
+  });
 }
 
 function runDaemonTests(grepPattern, invert, res, options = {}) {
@@ -339,7 +351,7 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
 
   // Reject new test runs if shutting down
   if (shuttingDown) {
-    res.write(`data: ${JSON.stringify({ type: 'shutdown', reason: 'Server is shutting down' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'daemon-shutdown', reason: 'already-shutting-down' })}\n\n`);
     res.end();
     return;
   }
