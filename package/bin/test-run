@@ -841,6 +841,43 @@ async function waitForLockOrDaemon(quiet = false) {
 // transient flakes become slightly-slower-but-successful runs.
 const MAX_DAEMON_STARTUP_ATTEMPTS = 3
 
+// Pure helper: resolve a positive-integer-ms config from an env var with a
+// fallback default. Extracted so the parsing rules can be unit-tested
+// without booting Meteor — see tests/unit/daemonStartupTimeouts.test.mjs.
+function resolvePositiveMsEnv(envValue, fallbackMs) {
+  const raw = parseInt(envValue, 10)
+  return Number.isFinite(raw) && raw > 0 ? raw : fallbackMs
+}
+
+// Soft budget for `meteor test` to reach a serving /test/health.
+// On large full-app codebases the first cold build (server bundle compile
+// + Meteor.startup callbacks + post-build client recompile) reliably
+// exceeds 2 minutes — "Started proxy" appears around 70s, "Started MongoDB"
+// around 90s, and the health handler only goes live once the test driver
+// package's `start()` runs after the server bundle finishes loading. After
+// this soft budget we stop assuming "ready any second now" and start
+// requiring fresh log activity to keep waiting — see HARD_TIMEOUT below.
+const DAEMON_STARTUP_TIMEOUT_MS = resolvePositiveMsEnv(
+  process.env.TEST_DAEMON_STARTUP_TIMEOUT_MS,
+  240000,
+)
+
+// Hard ceiling: even with continuous log activity we never wait longer than
+// this for a single attempt. If we're still not healthy here, something is
+// genuinely wrong — likely deadlocked or memory-thrashing — and a retry
+// won't help. Configurable in case a particular app legitimately needs it.
+const DAEMON_STARTUP_HARD_TIMEOUT_MS = resolvePositiveMsEnv(
+  process.env.TEST_DAEMON_STARTUP_HARD_TIMEOUT_MS,
+  600000,
+)
+
+// Forward-progress window. Once past the soft budget we only keep waiting
+// if the daemon log file has been written to within this window. Log going
+// quiet for this long past the soft budget means the build is no longer
+// making progress — give up, surface diagnostics, and let the caller see
+// the real stall instead of burning the full hard ceiling on a dead build.
+const DAEMON_PROGRESS_STALL_MS = 45000
+
 /**
  * Structured event logger for daemon lifecycle diagnostics.
  *
@@ -894,6 +931,19 @@ function captureDiagnosticSnapshot(label, daemonPid) {
     const stat = fs.statSync(path.join(process.cwd(), '.meteor', 'local'))
     snapshot.dotmeteor_local_mtime = stat.mtime.toISOString()
   } catch { snapshot.dotmeteor_local_mtime = null }
+  // Was the daemon log written to recently? Helps distinguish "build still
+  // making forward progress" (slow, raise the timeout) from "daemon is alive
+  // but hung" (real deadlock, the next investigation step).
+  try {
+    const stat = fs.statSync(logFile)
+    snapshot.log_mtime = stat.mtime.toISOString()
+    snapshot.log_silent_ms = Math.max(0, Date.now() - stat.mtime.getTime())
+    snapshot.log_advancing = snapshot.log_silent_ms < DAEMON_PROGRESS_STALL_MS
+  } catch {
+    snapshot.log_mtime = null
+    snapshot.log_silent_ms = null
+    snapshot.log_advancing = null
+  }
   return snapshot
 }
 
@@ -1001,15 +1051,24 @@ async function startDaemon(quiet = false) {
 
       if (!quiet) console.log(`${colors.dim}Waiting for daemon to be ready...${colors.reset}`)
       const startTime = Date.now()
-      const timeout = 120000 // 2 minutes per attempt
+      const softTimeout = DAEMON_STARTUP_TIMEOUT_MS
+      const hardTimeout = DAEMON_STARTUP_HARD_TIMEOUT_MS
       const daemonPid = child.pid
       let pollTick = 0
       let lastPhase = 'spawned'
+      let extendedAnnounced = false
       let result = null // one of 'ready' | 'crashed' | 'timeout'
 
-      while (Date.now() - startTime < timeout) {
+      while (true) {
         pollTick++
         const elapsedMs = Date.now() - startTime
+
+        // Hard ceiling — no amount of forward progress justifies waiting
+        // longer than this for a single attempt.
+        if (elapsedMs >= hardTimeout) {
+          result = 'timeout'
+          break
+        }
 
         // Emit a heartbeat every ~10s so we know the poller is alive
         // and can see roughly where in the startup we got stuck.
@@ -1034,7 +1093,44 @@ async function startDaemon(quiet = false) {
           result = 'ready'
           break
         }
-        lastPhase = 'polling-health'
+
+        // Past the soft budget? Only keep waiting if the daemon log is
+        // still being written to — that's our signal the build is making
+        // forward progress vs deadlocked. Silence past the soft budget is
+        // the real stall signal.
+        if (elapsedMs >= softTimeout) {
+          let logSilentMs = Infinity
+          try {
+            logSilentMs = Date.now() - fs.statSync(logFile).mtime.getTime()
+          } catch {
+            // Log file vanished — treat as worst-case silence.
+          }
+          if (logSilentMs >= DAEMON_PROGRESS_STALL_MS) {
+            result = 'timeout'
+            lastPhase = 'progress-stalled'
+            logDaemonEvent('startup-progress-stalled', {
+              attempt,
+              poll_tick: pollTick,
+              elapsed_ms: elapsedMs,
+              log_silent_ms: Number.isFinite(logSilentMs) ? logSilentMs : null,
+            }, { quiet })
+            break
+          }
+          if (!extendedAnnounced) {
+            extendedAnnounced = true
+            lastPhase = 'extended-build'
+            logDaemonEvent('startup-extended', {
+              attempt,
+              poll_tick: pollTick,
+              elapsed_ms: elapsedMs,
+              soft_timeout_ms: softTimeout,
+              hard_timeout_ms: hardTimeout,
+              reason: 'log still advancing past soft timeout',
+            }, { quiet })
+          }
+        }
+
+        if (lastPhase !== 'extended-build') lastPhase = 'polling-health'
         await new Promise(r => setTimeout(r, 2000))
       }
 
@@ -2084,6 +2180,7 @@ module.exports = {
   createRestartLoopTracker,
   shouldReportNoTestsMatched,
   parseMochaJsonPayload,
+  resolvePositiveMsEnv,
   extractMochaJsonFromMixedOutput,
   summarizeFailures,
   buildLlmSummary,

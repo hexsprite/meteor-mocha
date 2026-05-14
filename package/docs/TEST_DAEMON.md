@@ -167,6 +167,8 @@ data: {"type": "done", "failures": 1}
 | `TEST_PORT` | `9100` | Port for daemon HTTP server |
 | `TEST_DAEMON` | - | Set to any value to enable daemon mode |
 | `TEST_DAEMON_RELOAD_FILE` | `imports/startup/tests/server.ts` | File to touch when triggering a hot reload after Mongo timeouts |
+| `TEST_DAEMON_STARTUP_TIMEOUT_MS` | `240000` | Soft per-attempt budget for `meteor test` to reach a serving `/test/health`. After this, the poller keeps waiting only if the daemon log is still being written (forward-progress signal). |
+| `TEST_DAEMON_STARTUP_HARD_TIMEOUT_MS` | `600000` | Hard per-attempt ceiling — even with continuous log activity we never wait longer than this for a single attempt before retrying / failing. |
 
 ## File Tracking
 
