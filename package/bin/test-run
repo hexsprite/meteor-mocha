@@ -1515,7 +1515,94 @@ Examples:
   runTests()
 }
 
+// Max time to wait for a rebuild to catch up to a just-edited file before we
+// declare the daemon wedged. Healthy full-app rebuilds on a loaded machine were
+// observed at 45–60s, so this budget errs long: a genuinely wedged watcher never
+// rebuilds, so over-waiting only delays the warning, while under-waiting cries
+// wolf on a slow-but-healthy rebuild (far worse — it trains people to ignore it).
+const STALE_WAIT_MS = +(process.env.TEST_DAEMON_STALE_WAIT_MS || 120000)
+
+/** Fetch /test/health as JSON, or null on any error/timeout. */
+function getHealthJson() {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${port}/test/health`, (res) => {
+      let data = ''
+      res.on('data', (c) => (data += c))
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data))
+        } catch {
+          resolve(null)
+        }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.setTimeout(3000, () => {
+      req.destroy()
+      resolve(null)
+    })
+  })
+}
+
+/**
+ * Staleness guard. A wedged Meteor watcher keeps serving the last-built suite
+ * while /test/health still reports "ready" — so a file-targeted run can return
+ * confident pass/fail for code that no longer exists on disk (observed: a test
+ * title that had been renamed away still "ran"). Compare the target file's
+ * mtime to the daemon's builtAt (its rebuild timestamp). If the file is newer,
+ * a rebuild is either in flight (builtAt will catch up in seconds — we wait) or
+ * the watcher is wedged (builtAt never catches up — we report stale instead of
+ * lying). Only applies to file-targeted runs; older daemons without builtAt are
+ * skipped (backward compatible).
+ */
+async function ensureDaemonFresh() {
+  if (!filePattern) return { stale: false }
+  let mtimeMs
+  try {
+    mtimeMs = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
+  } catch {
+    return { stale: false } // file gone/unreadable — nothing to guard
+  }
+  const first = await getHealthJson()
+  if (!first || typeof first.builtAt !== 'number') return { stale: false }
+  if (mtimeMs <= first.builtAt) return { stale: false }
+
+  const deadline = Date.now() + STALE_WAIT_MS
+  while (Date.now() <= deadline) {
+    await new Promise((r) => setTimeout(r, 500))
+    const h = await getHealthJson()
+    // null health = server restarting mid-rebuild → keep waiting.
+    if (h && typeof h.builtAt === 'number' && mtimeMs <= h.builtAt) {
+      return { stale: false }
+    }
+  }
+  return { stale: true, mtimeMs, builtAt: first.builtAt }
+}
+
 async function runTests() {
+  // Refuse to serve results from a wedged daemon (stale bundle). See
+  // ensureDaemonFresh — a slow-but-healthy rebuild waits, a wedged one reports.
+  const freshness = await ensureDaemonFresh()
+  if (freshness.stale) {
+    const lagS = Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)
+    const fix = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
+    if (jsonMode) {
+      printMachineOutput({
+        success: false,
+        stale: true,
+        error: `Daemon appears wedged: ${filePattern} was modified ~${lagS}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`,
+        file: filePattern,
+      })
+    } else {
+      console.error(
+        `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${filePattern} changed ~${lagS}s after the last rebuild and none has landed. Results would reflect OLD code.`,
+      )
+      console.error(`${colors.yellow}${fix}${colors.reset}\n`)
+    }
+    process.exitCode = 2
+    return
+  }
+
   // Check cache for full test runs (no grep, no file filter, no invert)
   // Cache checks file mtimes, so changed files will invalidate it automatically
   const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
