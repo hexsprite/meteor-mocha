@@ -1,14 +1,13 @@
 // Unit tests for getProjectMtime's source scan.
 //
-// Regression target: getProjectMtime used to rely on fs.promises.glob, which
-// only exists on Node 22+. This CLI runs under `#!/usr/bin/env node` — whatever
-// node is on PATH, which in CI/contributor envs is still Node 20.20.x. Once the
-// staleness guard put getProjectMtime on the file-targeted path, the documented
-// `./scripts/test-run imports/...app-spec.ts` workflow threw before it could
-// even hit the daemon. The fix replaces glob with a plain recursive readdir
-// walk (available on every supported Node). These tests exercise that walk
-// directly — so a regression back to glob (or a broken walk) fails here — and
-// pin the root/skip contract.
+// getProjectMtime is a recursive readdir walk (not fs.promises.glob) so it can
+// scan /packages without descending into local packages' installed node_modules
+// — a `packages/**` glob would, and a routine `meteor npm install` would then
+// bump the freshness basis and spuriously trip the staleness guard. These tests
+// pin that contract: the walk finds nested sources across every bundled root,
+// skips node_modules/build output, ignores non-source extensions, and doesn't
+// throw on absent roots. A regression that reintroduced dependency-tree
+// traversal (or dropped a root) fails here.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

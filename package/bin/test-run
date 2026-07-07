@@ -473,12 +473,15 @@ const PROJECT_SCAN_SKIP_DIRS = new Set([
 /**
  * Latest mtime across all project source files under the bundled roots.
  *
- * Deliberately a plain recursive readdir walk, NOT fs.promises.glob: glob only
- * landed in Node 22, and this CLI runs under whatever `node` is on PATH (the
- * wrapper is `#!/usr/bin/env node`), which in CI/contributor envs is still
- * Node 20. Putting a glob-dependent helper on the file-targeted staleness path
- * threw before the daemon was even asked to run. readdirSync withFileTypes is
- * available on every supported Node.
+ * A plain recursive readdir walk with an explicit skip list, chosen over
+ * fs.promises.glob because it needs to scan /packages — local Meteor packages
+ * that can carry their own installed node_modules (the meteor-mocha submodule
+ * itself does once its dev deps are present). A `packages/**` glob would descend
+ * into those dependency trees, so a routine `meteor npm install` would bump the
+ * freshness basis and spuriously trip the staleness guard. The walk skips
+ * node_modules/build output outright, and skipping symlinked dirs (isDirectory()
+ * is false for a symlink Dirent) means no cycle risk. (Runtime is Meteor 3.5's
+ * Node 24 everywhere this runs — Node compatibility is not the motivation.)
  *
  * Params are injectable for unit testing; production calls use the defaults.
  */
