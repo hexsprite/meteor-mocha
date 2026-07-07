@@ -1581,11 +1581,16 @@ function computeStaleBasis({ targetMtime, projectMtime, builtAt }) {
  */
 async function ensureDaemonFresh() {
   if (!filePattern) return { stale: false }
-  let targetMtime
+  // filePattern may be a *partial* path — the documented `-f Foo.app-spec.ts`
+  // and bare-positional workflows pass a filename the daemon resolves via suite
+  // matching, so a direct stat throws. Don't bail to "fresh" in that case: the
+  // project mtime (which globs imports//server//client/, where specs live) still
+  // gates freshness. Default targetMtime to 0 so computeStaleBasis leans on it.
+  let targetMtime = 0
   try {
     targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
   } catch {
-    return { stale: false } // file gone/unreadable — nothing to guard
+    targetMtime = 0 // partial pattern or file gone — project mtime still guards
   }
   const first = await getHealthJson()
   if (!first || typeof first.builtAt !== 'number') return { stale: false }

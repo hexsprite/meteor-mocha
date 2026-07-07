@@ -58,6 +58,25 @@ test('uses the project mtime when both are newer and the project is the newest',
   );
 });
 
+test('unstattable target (partial -f pattern): project mtime still guards', () => {
+  // When `-f Foo.app-spec.ts` / a bare positional filename can't be statted,
+  // ensureDaemonFresh passes targetMtime=0. A stale project must NOT be waved
+  // through as fresh just because the spec path didn't resolve — the guard has
+  // to lean on the project mtime. Regression for the codex finding that the
+  // catch branch returned stale:false and blinded the guard on this workflow.
+  assert.equal(
+    computeStaleBasis({ targetMtime: 0, projectMtime: 1500, builtAt: BUILT_AT }),
+    1500,
+  );
+});
+
+test('unstattable target with a fresh project stays fresh', () => {
+  assert.equal(
+    computeStaleBasis({ targetMtime: 0, projectMtime: 800, builtAt: BUILT_AT }),
+    null,
+  );
+});
+
 test('equality with builtAt counts as fresh (not-newer, mirrors <= semantics)', () => {
   assert.equal(
     computeStaleBasis({ targetMtime: BUILT_AT, projectMtime: BUILT_AT, builtAt: BUILT_AT }),
