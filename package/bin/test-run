@@ -1545,27 +1545,57 @@ function getHealthJson() {
 }
 
 /**
+ * Pure core of the staleness guard: given the targeted spec's mtime, the newest
+ * project-source mtime, and the daemon's builtAt, return the source mtime that
+ * should be compared against builtAt — or null when nothing on disk is newer
+ * than the last build (definitely fresh).
+ *
+ * We fold in the project mtime because comparing only the targeted spec misses
+ * the common TDD loop: edit an implementation file under imports/ (or server//
+ * client/), then rerun the *same* spec without touching it. The spec's mtime is
+ * still <= builtAt, so a spec-only check reports fresh even when a wedged
+ * watcher is serving a bundle that predates the impl edit. The impl file is the
+ * thing that changed, so its mtime is what must gate freshness.
+ */
+function computeStaleBasis({ targetMtime, projectMtime, builtAt }) {
+  // The newest source on disk is what a healthy rebuild must catch up to. Using
+  // anything less (e.g. only the spec when an impl file is newer still) would
+  // let the wait loop declare "fresh" once builtAt passes the spec while the
+  // newer impl edit remains unbuilt — the same lie, one file over.
+  const newest = Math.max(targetMtime, projectMtime)
+  return newest > builtAt ? newest : null
+}
+
+/**
  * Staleness guard. A wedged Meteor watcher keeps serving the last-built suite
  * while /test/health still reports "ready" — so a file-targeted run can return
  * confident pass/fail for code that no longer exists on disk (observed: a test
- * title that had been renamed away still "ran"). Compare the target file's
- * mtime to the daemon's builtAt (its rebuild timestamp). If the file is newer,
+ * title that had been renamed away still "ran"). Compare the newest relevant
+ * source mtime (the target spec OR any project file under imports//server//
+ * client/) to the daemon's builtAt (its rebuild timestamp). If disk is newer,
  * a rebuild is either in flight (builtAt will catch up in seconds — we wait) or
  * the watcher is wedged (builtAt never catches up — we report stale instead of
  * lying). Only applies to file-targeted runs; older daemons without builtAt are
- * skipped (backward compatible).
+ * skipped (backward compatible). See computeStaleBasis for why the project
+ * mtime is folded in, not just the spec's.
  */
 async function ensureDaemonFresh() {
   if (!filePattern) return { stale: false }
-  let mtimeMs
+  let targetMtime
   try {
-    mtimeMs = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
+    targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
   } catch {
     return { stale: false } // file gone/unreadable — nothing to guard
   }
   const first = await getHealthJson()
   if (!first || typeof first.builtAt !== 'number') return { stale: false }
-  if (mtimeMs <= first.builtAt) return { stale: false }
+  const projectMtime = await getProjectMtime()
+  const mtimeMs = computeStaleBasis({
+    targetMtime,
+    projectMtime,
+    builtAt: first.builtAt,
+  })
+  if (mtimeMs === null) return { stale: false }
 
   const deadline = Date.now() + STALE_WAIT_MS
   while (Date.now() <= deadline) {
@@ -2279,4 +2309,5 @@ module.exports = {
   isMongoTimeoutMessage,
   touchHotReloadFile,
   waitForDaemonRestart,
+  computeStaleBasis,
 }
