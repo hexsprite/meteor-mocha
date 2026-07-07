@@ -439,35 +439,67 @@ function tailLogFile() {
   return { start: startTailing, stop: stopTailing }
 }
 
-/**
- * Get latest mtime across all project files
- */
-async function getProjectMtime() {
-  // Include the legacy roots Meteor/Rspack still bundles via explicit imports
-  // (imports/utils/dateparse.app-spec.ts imports /lib/dateparse, etc.). Missing
-  // them let an edit under lib//common/ slip past the staleness guard: an
-  // unchanged spec that imports the edited module would show old mtimes and be
-  // served stale by a wedged daemon.
-  const patterns = [
-    'imports/**/*.{ts,tsx,js,jsx}',
-    'server/**/*.{ts,js}',
-    'client/**/*.{ts,tsx,js,jsx}',
-    'lib/**/*.{ts,tsx,js,jsx}',
-    'common/**/*.{ts,tsx,js,jsx}',
-  ]
+// Source roots Meteor/Rspack actually bundles. Beyond the obvious imports//
+// server//client/, the app still loads the legacy /lib + /common roots via
+// explicit imports (imports/utils/dateparse.app-spec.ts imports /lib/dateparse)
+// and its local Meteor packages under /packages. An edit under any of these can
+// change what a spec exercises, so all must feed the staleness basis — else an
+// unchanged spec importing the edited module shows old mtimes and a wedged
+// daemon serves it stale.
+const PROJECT_SOURCE_ROOTS = ['imports', 'server', 'client', 'lib', 'common', 'packages']
+const PROJECT_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx'])
+// Never descend into dependency trees or build output — they aren't sources and
+// dwarf everything else. (Skipping node_modules also keeps /packages cheap.)
+const PROJECT_SCAN_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.meteor',
+  'dist',
+  'build',
+  '.build',
+  'coverage',
+])
 
+/**
+ * Latest mtime across all project source files under the bundled roots.
+ *
+ * Deliberately a plain recursive readdir walk, NOT fs.promises.glob: glob only
+ * landed in Node 22, and this CLI runs under whatever `node` is on PATH (the
+ * wrapper is `#!/usr/bin/env node`), which in CI/contributor envs is still
+ * Node 20. Putting a glob-dependent helper on the file-targeted staleness path
+ * threw before the daemon was even asked to run. readdirSync withFileTypes is
+ * available on every supported Node.
+ *
+ * Params are injectable for unit testing; production calls use the defaults.
+ */
+async function getProjectMtime(cwd = process.cwd(), roots = PROJECT_SOURCE_ROOTS) {
   let latestMtime = 0
 
-  for (const pattern of patterns) {
-    const fullPattern = path.join(process.cwd(), pattern)
-    for await (const file of fs.promises.glob(fullPattern)) {
-      try {
-        const stat = fs.statSync(file)
-        if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs
-      } catch {
-        // File gone - ignore
+  const walk = (dir) => {
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return // root absent (e.g. no /common) or unreadable — skip
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (PROJECT_SCAN_SKIP_DIRS.has(entry.name)) continue
+        walk(full)
+      } else if (entry.isFile() && PROJECT_SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
+        try {
+          const { mtimeMs } = fs.statSync(full)
+          if (mtimeMs > latestMtime) latestMtime = mtimeMs
+        } catch {
+          // File vanished mid-walk — ignore
+        }
       }
     }
+  }
+
+  for (const root of roots) {
+    walk(path.join(cwd, root))
   }
 
   return latestMtime
@@ -2347,4 +2379,5 @@ module.exports = {
   waitForDaemonRestart,
   computeStaleBasis,
   isMissingExactTarget,
+  getProjectMtime,
 }
