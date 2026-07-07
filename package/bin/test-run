@@ -443,10 +443,17 @@ function tailLogFile() {
  * Get latest mtime across all project files
  */
 async function getProjectMtime() {
+  // Include the legacy roots Meteor/Rspack still bundles via explicit imports
+  // (imports/utils/dateparse.app-spec.ts imports /lib/dateparse, etc.). Missing
+  // them let an edit under lib//common/ slip past the staleness guard: an
+  // unchanged spec that imports the edited module would show old mtimes and be
+  // served stale by a wedged daemon.
   const patterns = [
     'imports/**/*.{ts,tsx,js,jsx}',
     'server/**/*.{ts,js}',
     'client/**/*.{ts,tsx,js,jsx}',
+    'lib/**/*.{ts,tsx,js,jsx}',
+    'common/**/*.{ts,tsx,js,jsx}',
   ]
 
   let latestMtime = 0
@@ -1567,6 +1574,18 @@ function computeStaleBasis({ targetMtime, projectMtime, builtAt }) {
 }
 
 /**
+ * An unstattable target splits two ways: a *bare filename* (no separator) is a
+ * partial pattern the daemon resolves via suite matching — legitimate, so we
+ * fall back to the project mtime. An *exact path* (has a separator) that can't
+ * be statted means the user named a concrete spec that's been deleted/renamed;
+ * getProjectMtime only sees files that still exist, so it can't prove the
+ * daemon isn't still running the removed spec. Treat that as a hard stale.
+ */
+function isMissingExactTarget(pattern) {
+  return pattern.includes('/') || pattern.includes(path.sep)
+}
+
+/**
  * Staleness guard. A wedged Meteor watcher keeps serving the last-built suite
  * while /test/health still reports "ready" — so a file-targeted run can return
  * confident pass/fail for code that no longer exists on disk (observed: a test
@@ -1590,7 +1609,14 @@ async function ensureDaemonFresh() {
   try {
     targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
   } catch {
-    targetMtime = 0 // partial pattern or file gone — project mtime still guards
+    // Exact path that's gone → the daemon may still hold the removed spec and
+    // we can't verify otherwise: hard stale, no point waiting for a rebuild
+    // that won't bring the file back. Bare filename → partial pattern, fall
+    // through and let the project mtime guard it.
+    if (isMissingExactTarget(filePattern)) {
+      return { stale: true, missing: true }
+    }
+    targetMtime = 0
   }
   const first = await getHealthJson()
   if (!first || typeof first.builtAt !== 'number') return { stale: false }
@@ -1619,19 +1645,24 @@ async function runTests() {
   // ensureDaemonFresh — a slow-but-healthy rebuild waits, a wedged one reports.
   const freshness = await ensureDaemonFresh()
   if (freshness.stale) {
-    const lagS = Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)
     const fix = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
+    // Two stale shapes: a concrete target that's gone (missing), or a wedged
+    // watcher whose builtAt never caught up to a newer source (lag).
+    const staleError = freshness.missing
+      ? `Target not found: ${filePattern} does not exist on disk (deleted/renamed?). The daemon may still be running the old spec, so results can't be trusted. ${fix}`
+      : `Daemon appears wedged: ${filePattern} was modified ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`
     if (jsonMode) {
       printMachineOutput({
         success: false,
         stale: true,
-        error: `Daemon appears wedged: ${filePattern} was modified ~${lagS}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`,
+        error: staleError,
         file: filePattern,
       })
     } else {
-      console.error(
-        `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${filePattern} changed ~${lagS}s after the last rebuild and none has landed. Results would reflect OLD code.`,
-      )
+      const headline = freshness.missing
+        ? `\n${colors.red}⚠ Target not found${colors.reset} — ${filePattern} is not on disk. The daemon may still hold the old spec; results would reflect a file that no longer exists.`
+        : `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${filePattern} changed ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the last rebuild and none has landed. Results would reflect OLD code.`
+      console.error(headline)
       console.error(`${colors.yellow}${fix}${colors.reset}\n`)
     }
     process.exitCode = 2
@@ -2315,4 +2346,5 @@ module.exports = {
   touchHotReloadFile,
   waitForDaemonRestart,
   computeStaleBasis,
+  isMissingExactTarget,
 }

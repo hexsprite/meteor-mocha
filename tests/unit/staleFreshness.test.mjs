@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { computeStaleBasis } = require('../../package/bin/test-run');
+const { computeStaleBasis, isMissingExactTarget } = require('../../package/bin/test-run');
 
 const BUILT_AT = 1000;
 
@@ -82,4 +82,25 @@ test('equality with builtAt counts as fresh (not-newer, mirrors <= semantics)', 
     computeStaleBasis({ targetMtime: BUILT_AT, projectMtime: BUILT_AT, builtAt: BUILT_AT }),
     null,
   );
+});
+
+// isMissingExactTarget — a deleted/renamed concrete spec path must be treated
+// as a hard stale (the daemon may still hold the removed spec), while a bare
+// partial filename is a legitimate suite-match pattern that falls back to the
+// project mtime. Regression for the codex finding that an unstattable exact
+// target was waved through as fresh.
+test('exact path with a separator is a missing target (hard stale)', () => {
+  assert.equal(isMissingExactTarget('imports/api/foo/FullSync.app-spec.ts'), true);
+});
+
+test('nested relative path counts as an exact target', () => {
+  assert.equal(isMissingExactTarget('tests/e2e/login.spec.ts'), true);
+});
+
+test('bare filename is a partial pattern, not a missing exact target', () => {
+  assert.equal(isMissingExactTarget('FullSync.app-spec.ts'), false);
+});
+
+test('bare pattern without a separator is not an exact target', () => {
+  assert.equal(isMissingExactTarget('FullSync'), false);
 });
