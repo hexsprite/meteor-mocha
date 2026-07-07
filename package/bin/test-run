@@ -441,12 +441,22 @@ function tailLogFile() {
 
 // Source roots Meteor/Rspack actually bundles. Beyond the obvious imports//
 // server//client/, the app still loads the legacy /lib + /common roots via
-// explicit imports (imports/utils/dateparse.app-spec.ts imports /lib/dateparse)
-// and its local Meteor packages under /packages. An edit under any of these can
-// change what a spec exercises, so all must feed the staleness basis — else an
-// unchanged spec importing the edited module shows old mtimes and a wedged
-// daemon serves it stale.
-const PROJECT_SOURCE_ROOTS = ['imports', 'server', 'client', 'lib', 'common', 'packages']
+// explicit imports (imports/utils/dateparse.app-spec.ts imports /lib/dateparse),
+// its local Meteor packages under /packages, and the mobile/web/support apps
+// under /apps (imports/startup/client imports /apps/mobile + /apps/web; specs
+// import /apps/support-agent). An edit under any of these can change what a
+// spec exercises, so all must feed the staleness basis — else an unchanged spec
+// importing the edited module shows old mtimes and a wedged daemon serves it
+// stale.
+const PROJECT_SOURCE_ROOTS = [
+  'imports',
+  'server',
+  'client',
+  'lib',
+  'common',
+  'packages',
+  'apps',
+]
 const PROJECT_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx'])
 // Never descend into dependency trees or build output — they aren't sources and
 // dwarf everything else. (Skipping node_modules also keeps /packages cheap.)

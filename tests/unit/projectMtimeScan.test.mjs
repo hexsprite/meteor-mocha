@@ -73,3 +73,14 @@ test('returns 0 when no roots exist (absent /common etc.) — no throw', async (
   const latest = await getProjectMtime(root, ['does-not-exist']);
   assert.equal(latest, 0);
 });
+
+// Default roots must cover /apps: the app bundles /apps/mobile, /apps/web, and
+// /apps/support-agent via explicit imports, so an edit there has to gate
+// freshness. Calling with the DEFAULT root list (no second arg) proves apps is
+// included, not just reachable when named explicitly.
+test('default roots include /apps (mobile/web/support are bundled)', async () => {
+  const { root, write } = makeTree();
+  write('apps/mobile/startup/index.tsx', 6_000_000);
+  const latest = await getProjectMtime(root);
+  assert.equal(latest, 6_000_000);
+});
