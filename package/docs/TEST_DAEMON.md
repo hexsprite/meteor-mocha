@@ -157,8 +157,38 @@ data: {"type": "log", "data": "  ✓ creates calendar connection"}
 
 data: {"type": "error", "data": "  ✗ fails on invalid token"}
 
-data: {"type": "done", "failures": 1}
+data: {"type": "done", "failures": 1, "suitesTotal": 62, "testsMatched": 3}
 ```
+
+The `done` event carries two diagnostic counts:
+
+- `suitesTotal` — top-level suites loaded in the daemon **before** grep
+  filtering. A healthy full-app daemon has dozens/hundreds; `0` means the bundle
+  came back empty/broken.
+- `testsMatched` — tests scheduled to run after grep filtering (Mocha's
+  `runner.total`).
+
+### Wedged-empty-bundle detection
+
+The daemon can enter a state where a rebuild fired (so `builtAt` is fresh and the
+staleness guard passes) but the bundle collapsed to **0 suites**, while
+`/test/health` still reports `status: "ready"`. A bare full run against it
+returns a clean-looking `{tests: 0, success: true}` — a false all-clear
+indistinguishable from "everything passed".
+
+The client (`bin/test-run`) guards this two ways:
+
+1. **Pre-run gate** — before dispatching, it re-polls `/test/health`; a `ready`
+   daemon reporting `suites: 0` (after a brief settle poll to rule out a cold
+   boot still registering specs) is reported as `wedged_empty_bundle` (exit 2),
+   not run.
+2. **Post-run confirmation** — a `done` event with `suitesTotal: 0` is reported
+   as `wedged_empty_bundle` rather than a genuine `no_tests_matched`. With
+   `suitesTotal > 0`, a `testsMatched: 0` result stays a real no-match.
+
+Older daemons that omit `suites`/`suitesTotal` never trigger either path
+(missing data is never escalated to a wedge). Fix a wedge by bouncing the
+daemon: `./scripts/test-run daemon stop` (auto-restarts on the next run).
 
 ## Environment Variables
 

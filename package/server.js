@@ -511,6 +511,15 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     }
   }, 10000);
 
+  // Snapshot the loaded suite tree BEFORE this run. A healthy full-app daemon
+  // has hundreds of top-level suites; 0 means the bundle came back empty/broken
+  // (the "wedged empty bundle" failure mode: a rebuild fired, builtAt refreshed
+  // so the staleness guard passes, but the bundle collapsed to nothing). We emit
+  // this on 'done' so the client can tell a genuine no-match (suitesTotal>0,
+  // tests=0) apart from a wedged empty daemon (suitesTotal=0) instead of both
+  // looking like a clean "no tests" all-clear.
+  const suitesTotal = mochaInstance.suite.suites.length;
+
   const runner = mochaInstance.run(async (failureCount) => {
     clearInterval(heartbeat);
 
@@ -545,7 +554,8 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
         if (useJsonReporter && jsonBuffer) {
           res.write(`data: ${JSON.stringify({ type: 'json', data: jsonBuffer.trim() })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount })}\n\n`);
+        // testsMatched = tests scheduled after grep filtering (Mocha's runner.total).
+        res.write(`data: ${JSON.stringify({ type: 'done', failures: failureCount, suitesTotal, testsMatched: runner.total })}\n\n`);
         res.end();
       } catch (e) {
         // Connection closed

@@ -1685,6 +1685,69 @@ async function ensureDaemonFresh() {
   return { stale: true, mtimeMs, builtAt: first.builtAt }
 }
 
+/**
+ * Wedged-empty-bundle guard (Mode B). Distinct from the staleness guard above:
+ * there the daemon serves an OLD-but-valid suite (builtAt lags disk); here a
+ * rebuild DID fire — builtAt is fresh, so ensureDaemonFresh passes — but the
+ * bundle came back broken and mocha's suite tree collapsed to 0. The daemon
+ * still reports status:ready, so a bare full run returns a clean-looking
+ * {tests:0, success:true}: a false all-clear that reads identically to "all
+ * tests passed". A healthy full-app daemon always has hundreds of suites, so 0
+ * is unambiguous. We re-poll briefly first so a cold boot that hasn't finished
+ * registering eager specs isn't mistaken for a wedge.
+ */
+/**
+ * Pure core: classify a /test/health body as a loaded, empty, or
+ * indeterminate suite tree. 'unknown' (no health / suites omitted by an older
+ * daemon) is deliberately NOT 'empty' — we never escalate to a wedge report on
+ * missing data, only on an explicit suites:0 from a daemon that reports ready.
+ */
+function classifyDaemonFullness(health) {
+  if (!health || typeof health.suites !== 'number') return 'unknown'
+  return health.suites > 0 ? 'loaded' : 'empty'
+}
+
+/** Pure core: a 'done' payload whose bundle was empty (suitesTotal explicitly 0). */
+function isWedgedEmptyResult(data) {
+  return Boolean(data) && typeof data.suitesTotal === 'number' && data.suitesTotal === 0
+}
+
+async function ensureDaemonNotEmpty() {
+  const ATTEMPTS = 4
+  for (let i = 0; i < ATTEMPTS; i++) {
+    const fullness = classifyDaemonFullness(await getHealthJson())
+    // Missing/omitted suites (older daemon build) → can't judge; treat as fine.
+    if (fullness !== 'empty') return { empty: false }
+    if (i < ATTEMPTS - 1) await new Promise((r) => setTimeout(r, 500))
+  }
+  return { empty: true }
+}
+
+/**
+ * Report a wedged empty bundle and set a non-zero exit. Shared by the pre-run
+ * gate (Detector 1) and the post-run confirmation (suitesTotal===0 on 'done').
+ */
+function reportWedgedEmptyBundle(grep) {
+  const fix = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
+  const message = `Daemon appears WEDGED: it reports ready but its loaded suite tree is empty (0 suites). A run would report "no tests" / a false all-clear instead of actually testing — usually a rebuild that produced a broken or empty bundle. ${fix}`
+  if (jsonMode) {
+    printMachineOutput({
+      success: false,
+      wedged: true,
+      error: 'wedged_empty_bundle',
+      message,
+      hint: fix,
+      grep: grep || null,
+      file: filePattern || null,
+      stats: { suites: 0, tests: 0, passes: 0, pending: 0, failures: 0 },
+    })
+  } else {
+    console.error(`\n${colors.red}⚠ Test daemon appears WEDGED${colors.reset} — reports ready but has 0 suites loaded. A run would falsely report no tests.`)
+    console.error(`${colors.yellow}${fix}${colors.reset}\n`)
+  }
+  process.exitCode = 2
+}
+
 async function runTests() {
   // Refuse to serve results from a wedged daemon (stale bundle). See
   // ensureDaemonFresh — a slow-but-healthy rebuild waits, a wedged one reports.
@@ -1838,6 +1901,14 @@ async function runTests() {
       process.exitCode = 1
       return
     }
+  }
+
+  // Daemon is confirmed ready here. Gate against the wedged-empty-bundle mode
+  // before dispatching: a run against a 0-suite daemon returns a false all-clear.
+  const emptiness = await ensureDaemonNotEmpty()
+  if (emptiness.empty) {
+    reportWedgedEmptyBundle(grep)
+    return
   }
 
   const params = new URLSearchParams()
@@ -2090,7 +2161,19 @@ async function runTests() {
 
         restartLoopTracker.reset()
 
-        // Check for no tests matched when a pattern was specified
+        // Post-run confirmation of the wedged-empty-bundle mode: the daemon
+        // emits suitesTotal (top-level suites loaded before grep). 0 means the
+        // bundle is empty — a false all-clear, NOT a genuine no-match. Catches a
+        // wedge that slipped past the pre-run gate (e.g. bundle collapsed mid-run,
+        // or the bare full-run path). Older daemons omit suitesTotal → skip.
+        const wedgedEmpty = isWedgedEmptyResult(data)
+        if (wedgedEmpty) {
+          reportWedgedEmptyBundle(grep)
+          break
+        }
+
+        // Check for no tests matched when a pattern was specified. suitesTotal>0
+        // here (or unknown), so tests=0 is a real no-match, not a wedge.
         const hasPattern = grep || filePattern
         const noTestsMatched = shouldReportNoTestsMatched(hasPattern, jsonResult, data)
         if (noTestsMatched) {
@@ -2393,4 +2476,6 @@ module.exports = {
   computeStaleBasis,
   isMissingExactTarget,
   getProjectMtime,
+  classifyDaemonFullness,
+  isWedgedEmptyResult,
 }
