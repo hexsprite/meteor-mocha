@@ -168,6 +168,33 @@ The `done` event carries two diagnostic counts:
 - `testsMatched` — tests scheduled to run after grep filtering (Mocha's
   `runner.total`).
 
+### Staleness guard
+
+Before dispatching **any** run, the client compares the newest relevant source
+mtime against the daemon's effective build time, and refuses to report results
+when disk is ahead. If a rebuild is merely in flight, the daemon catches up
+within seconds and the run proceeds; if it never catches up within
+`TEST_DAEMON_STALE_WAIT_MS`, the run exits 2 with `stale: true` instead of
+reporting pass/fail for code that never ran.
+
+- **Newest relevant source** is the max over `.ts/.tsx/.js/.jsx` files under the
+  bundled roots (`imports`, `server`, `client`, `lib`, `common`, `packages`,
+  `apps`), plus the targeted spec's own mtime when one was given. `node_modules`
+  and build output are skipped, and so are `*.d.ts` — ambient declarations carry
+  no runtime code, so no rebuild is ever triggered by them and including them
+  would produce false alarms.
+- **Effective build time** is `min(builtAt, bundle mtime)`. `builtAt` alone is
+  the *server process boot* time, so a restart that re-executes an unchanged,
+  stale bundle refreshes it and hides the staleness. The emitted
+  `<build-context>/*/server-rspack.js` mtime supplies the missing half; the
+  running code is no newer than either. When no bundle is found (non-rspack app,
+  unknown build context) the check falls back to `builtAt`.
+
+This applies to grep runs, file-targeted runs and bare full runs alike. It used
+to run only for file-targeted (`-f`/path) invocations, which left the everyday
+`test-run <pattern>` and `test-run -t <pattern>` forms reporting confident green
+against a wedged daemon (fo-u728l).
+
 ### Wedged-empty-bundle detection
 
 The daemon can enter a state where a rebuild fired (so `builtAt` is fresh and the

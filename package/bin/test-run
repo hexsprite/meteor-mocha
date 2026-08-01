@@ -458,6 +458,19 @@ const PROJECT_SOURCE_ROOTS = [
   'apps',
 ]
 const PROJECT_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx'])
+/**
+ * Ambient declaration files carry no runtime code, so a bundler never rebuilds
+ * for them — @meteorjs/rspack's watchOptions.ignored lists `**|/*.d.ts`
+ * explicitly. But `path.extname('foo.d.ts')` is '.ts', so a naive extension
+ * scan folds them into the freshness basis: touch one and the guard waits the
+ * full stale budget for a rebuild that will never come, then cries wedged on a
+ * perfectly healthy daemon. Excluding them keeps the guard's basis equal to
+ * "files a rebuild can actually be triggered by".
+ */
+function isFreshnessRelevantSourceFile(name) {
+  if (!PROJECT_SOURCE_EXTENSIONS.has(path.extname(name))) return false
+  return !name.endsWith('.d.ts')
+}
 // Never descend into dependency trees or build output — they aren't sources and
 // dwarf everything else. (Skipping node_modules also keeps /packages cheap.)
 const PROJECT_SCAN_SKIP_DIRS = new Set([
@@ -500,7 +513,7 @@ async function getProjectMtime(cwd = process.cwd(), roots = PROJECT_SOURCE_ROOTS
       if (entry.isDirectory()) {
         if (PROJECT_SCAN_SKIP_DIRS.has(entry.name)) continue
         walk(full)
-      } else if (entry.isFile() && PROJECT_SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
+      } else if (entry.isFile() && isFreshnessRelevantSourceFile(entry.name)) {
         try {
           const { mtimeMs } = fs.statSync(full)
           if (mtimeMs > latestMtime) latestMtime = mtimeMs
@@ -1573,6 +1586,12 @@ Examples:
 // rebuilds, so over-waiting only delays the warning, while under-waiting cries
 // wolf on a slow-but-healthy rebuild (far worse — it trains people to ignore it).
 const STALE_WAIT_MS = +(process.env.TEST_DAEMON_STALE_WAIT_MS || 120000)
+// Where the Meteor/rspack integration emits its bundles. The daemon runs with
+// RSPACK_BUILD_CONTEXT=_build-daemon; that env doesn't reach this client, so
+// default to the same value and allow an override for other setups.
+const BUILD_CONTEXT_DIR =
+  process.env.TEST_DAEMON_BUILD_CONTEXT || process.env.RSPACK_BUILD_CONTEXT || '_build-daemon'
+const SERVER_BUNDLE_FILENAME = 'server-rspack.js'
 
 /** Fetch /test/health as JSON, or null on any error/timeout. */
 function getHealthJson() {
@@ -1631,6 +1650,57 @@ function isMissingExactTarget(pattern) {
 }
 
 /**
+ * The daemon's `builtAt` is stamped at *module scope* in the test package, so
+ * it records when the server process booted — not when the bundle it loaded was
+ * compiled. Those diverge exactly when it matters (fo-u728l): Meteor restarts
+ * the server for any reason while the rspack watch child is wedged, the process
+ * re-executes the SAME stale bundle, and `builtAt` jumps to now. Freshness
+ * checked against boot time then reports "fresh" for code that was compiled
+ * before your edit.
+ *
+ * The emitted bundle's own mtime is the missing half. The running code is no
+ * newer than either signal — a bundle written after boot isn't loaded yet, and
+ * a boot after a wedged watcher re-runs old output — so the honest basis is the
+ * minimum. `bundleMtime` of 0 means "no bundle found" (non-rspack app, or an
+ * unknown build context): fall back to builtAt rather than invent staleness.
+ */
+function computeEffectiveBuiltAt({ builtAt, bundleMtime }) {
+  if (!bundleMtime) return builtAt
+  return Math.min(builtAt, bundleMtime)
+}
+
+/**
+ * Newest mtime among the server bundles rspack emits into the build-context
+ * directory (`_build-daemon/<mode>/server-rspack.js` and friends). Returns 0
+ * when the directory or the outputs are absent, which computeEffectiveBuiltAt
+ * reads as "no signal".
+ *
+ * Client-side on purpose: the Meteor *test* server runs with its cwd inside a
+ * temp `meteor-test-run*` build copy, so it cannot see these paths, while
+ * test-run always runs from the app root.
+ */
+function getBundleMtime(cwd = process.cwd(), contextDir = BUILD_CONTEXT_DIR) {
+  let newest = 0
+  const root = path.join(cwd, contextDir)
+  let modes
+  try {
+    modes = fs.readdirSync(root, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  for (const mode of modes) {
+    if (!mode.isDirectory()) continue
+    try {
+      const { mtimeMs } = fs.statSync(path.join(root, mode.name, SERVER_BUNDLE_FILENAME))
+      if (mtimeMs > newest) newest = mtimeMs
+    } catch {
+      // This mode emitted no server bundle — nothing to learn from it.
+    }
+  }
+  return newest
+}
+
+/**
  * Staleness guard. A wedged Meteor watcher keeps serving the last-built suite
  * while /test/health still reports "ready" — so a file-targeted run can return
  * confident pass/fail for code that no longer exists on disk (observed: a test
@@ -1639,38 +1709,45 @@ function isMissingExactTarget(pattern) {
  * client/) to the daemon's builtAt (its rebuild timestamp). If disk is newer,
  * a rebuild is either in flight (builtAt will catch up in seconds — we wait) or
  * the watcher is wedged (builtAt never catches up — we report stale instead of
- * lying). Only applies to file-targeted runs; older daemons without builtAt are
- * skipped (backward compatible). See computeStaleBasis for why the project
- * mtime is folded in, not just the spec's.
+ * lying). Older daemons without builtAt are skipped (backward compatible). See
+ * computeStaleBasis for why the project mtime is folded in, not just the
+ * spec's, and computeEffectiveBuiltAt for why builtAt alone is not trusted.
+ *
+ * fo-u728l: this used to `return { stale: false }` immediately unless a file
+ * pattern was given, so it only ever guarded `-f`/path-targeted runs. Every
+ * other documented invocation — `test-run Billing`, `test-run -t foo`, a bare
+ * full run — skipped the guard entirely and reported confident green against a
+ * wedged daemon. The freshness of the daemon has nothing to do with how the
+ * caller narrowed the suite, so the guard now runs unconditionally; the file
+ * pattern only contributes an extra mtime when there is one.
  */
 async function ensureDaemonFresh() {
-  if (!filePattern) return { stale: false }
   // filePattern may be a *partial* path — the documented `-f Foo.app-spec.ts`
   // and bare-positional workflows pass a filename the daemon resolves via suite
   // matching, so a direct stat throws. Don't bail to "fresh" in that case: the
   // project mtime (which globs imports//server//client/, where specs live) still
   // gates freshness. Default targetMtime to 0 so computeStaleBasis leans on it.
   let targetMtime = 0
-  try {
-    targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
-  } catch {
-    // Exact path that's gone → the daemon may still hold the removed spec and
-    // we can't verify otherwise: hard stale, no point waiting for a rebuild
-    // that won't bring the file back. Bare filename → partial pattern, fall
-    // through and let the project mtime guard it.
-    if (isMissingExactTarget(filePattern)) {
-      return { stale: true, missing: true }
+  if (filePattern) {
+    try {
+      targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
+    } catch {
+      // Exact path that's gone → the daemon may still hold the removed spec and
+      // we can't verify otherwise: hard stale, no point waiting for a rebuild
+      // that won't bring the file back. Bare filename → partial pattern, fall
+      // through and let the project mtime guard it.
+      if (isMissingExactTarget(filePattern)) {
+        return { stale: true, missing: true }
+      }
+      targetMtime = 0
     }
-    targetMtime = 0
   }
   const first = await getHealthJson()
   if (!first || typeof first.builtAt !== 'number') return { stale: false }
   const projectMtime = await getProjectMtime()
-  const mtimeMs = computeStaleBasis({
-    targetMtime,
-    projectMtime,
-    builtAt: first.builtAt,
-  })
+  const bundleMtime = getBundleMtime()
+  const builtAt = computeEffectiveBuiltAt({ builtAt: first.builtAt, bundleMtime })
+  const mtimeMs = computeStaleBasis({ targetMtime, projectMtime, builtAt })
   if (mtimeMs === null) return { stale: false }
 
   const deadline = Date.now() + STALE_WAIT_MS
@@ -1678,11 +1755,11 @@ async function ensureDaemonFresh() {
     await new Promise((r) => setTimeout(r, 500))
     const h = await getHealthJson()
     // null health = server restarting mid-rebuild → keep waiting.
-    if (h && typeof h.builtAt === 'number' && mtimeMs <= h.builtAt) {
-      return { stale: false }
-    }
+    if (!h || typeof h.builtAt !== 'number') continue
+    const fresh = computeEffectiveBuiltAt({ builtAt: h.builtAt, bundleMtime: getBundleMtime() })
+    if (mtimeMs <= fresh) return { stale: false }
   }
-  return { stale: true, mtimeMs, builtAt: first.builtAt }
+  return { stale: true, mtimeMs, builtAt }
 }
 
 /**
@@ -1756,20 +1833,21 @@ async function runTests() {
     const fix = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
     // Two stale shapes: a concrete target that's gone (missing), or a wedged
     // watcher whose builtAt never caught up to a newer source (lag).
+    const subject = filePattern || 'project source'
     const staleError = freshness.missing
       ? `Target not found: ${filePattern} does not exist on disk (deleted/renamed?). The daemon may still be running the old spec, so results can't be trusted. ${fix}`
-      : `Daemon appears wedged: ${filePattern} was modified ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`
+      : `Daemon appears wedged: ${subject} was modified ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`
     if (jsonMode) {
       printMachineOutput({
         success: false,
         stale: true,
         error: staleError,
-        file: filePattern,
+        file: filePattern || null,
       })
     } else {
       const headline = freshness.missing
         ? `\n${colors.red}⚠ Target not found${colors.reset} — ${filePattern} is not on disk. The daemon may still hold the old spec; results would reflect a file that no longer exists.`
-        : `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${filePattern} changed ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the last rebuild and none has landed. Results would reflect OLD code.`
+        : `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${subject} changed ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the last rebuild and none has landed. Results would reflect OLD code.`
       console.error(headline)
       console.error(`${colors.yellow}${fix}${colors.reset}\n`)
     }
@@ -2474,7 +2552,10 @@ module.exports = {
   touchHotReloadFile,
   waitForDaemonRestart,
   computeStaleBasis,
+  computeEffectiveBuiltAt,
+  isFreshnessRelevantSourceFile,
   isMissingExactTarget,
+  getBundleMtime,
   getProjectMtime,
   classifyDaemonFullness,
   isWedgedEmptyResult,
