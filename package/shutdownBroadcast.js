@@ -71,7 +71,7 @@ export function broadcastShutdown({
           res.once('close', once);
         }
       } catch (e) {
-        if (logger) logger(`[daemon] shutdown write failed: ${e && e.message}`);
+        if (logger) logger(`[daemon] shutdown write failed: ${e?.message}`);
         once();
       }
     }

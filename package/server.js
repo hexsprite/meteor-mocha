@@ -74,7 +74,7 @@ function getCallerFile() {
 if (typeof global.describe === 'function') {
   const originalDescribe = global.describe;
 
-  global.describe = function(title, fn) {
+  global.describe = (title, fn) => {
     const suite = originalDescribe(title, fn);
     if (suite && !suiteToFile.has(suite)) {
       const file = getCallerFile();
@@ -87,7 +87,7 @@ if (typeof global.describe === 'function') {
   };
 
   // Preserve describe.only and describe.skip
-  global.describe.only = function(title, fn) {
+  global.describe.only = (title, fn) => {
     const suite = originalDescribe.only(title, fn);
     if (suite && !suiteToFile.has(suite)) {
       const file = getCallerFile();
@@ -371,7 +371,7 @@ function setupShutdownHandlers() {
   process.on('SIGINT', () => shutdown('SIGINT', 0));
   process.on('uncaughtException', (err) => {
     console.error('[daemon] Uncaught exception, notifying clients and exiting:', err);
-    shutdown(`uncaughtException: ${err && err.message}`, 1);
+    shutdown(`uncaughtException: ${err?.message}`, 1);
   });
 }
 
@@ -540,7 +540,7 @@ function runDaemonTests(grepPattern, invert, res, options = {}) {
     if (previousSnapshotUpdate !== undefined) {
       process.env.SNAPSHOT_UPDATE = previousSnapshotUpdate;
     } else {
-      delete process.env.SNAPSHOT_UPDATE;
+      Reflect.deleteProperty(process.env, 'SNAPSHOT_UPDATE');
     }
 
     daemonTestsRunning = false;
@@ -590,7 +590,9 @@ function buildFileMap() {
       fileMap[file].push(suite.fullTitle());
     }
     if (suite.suites) {
-      suite.suites.forEach(child => walkSuites(child, file));
+      for (const child of suite.suites) {
+        walkSuites(child, file);
+      }
     }
   }
 
@@ -649,7 +651,9 @@ function findSuitesForFile(filePattern) {
       }
     }
     if (suite.suites) {
-      suite.suites.forEach(child => findSuites(child, file));
+      for (const child of suite.suites) {
+        findSuites(child, file);
+      }
     }
   }
 
@@ -670,6 +674,7 @@ function setupDaemonEndpoints() {
       suites: suiteCount,
       running: daemonTestsRunning,
       builtAt: BUILT_AT,
+      contextFingerprint: process.env.TEST_DAEMON_CONTEXT_FINGERPRINT || null,
     }));
   });
 

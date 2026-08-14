@@ -25,6 +25,7 @@ process.removeAllListeners('warning')
 
 const http = require('http')
 const { spawn, execSync } = require('child_process')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 
@@ -33,6 +34,8 @@ const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
 const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
 const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
 const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
+const DAEMON_CONTEXT_ENV_VAR = 'TEST_DAEMON_CONTEXT_FINGERPRINT'
+const DAEMON_CONTEXT_FILES = ['.env.test']
 const CACHE_TTL_MS = 60000 // 1 minute
 const HEALTH_CHECK_TIMEOUT_MS = 2000
 const RESTART_WAIT_TIMEOUT_MS = 120000
@@ -471,6 +474,29 @@ function isFreshnessRelevantSourceFile(name) {
   if (!PROJECT_SOURCE_EXTENSIONS.has(path.extname(name))) return false
   return !name.endsWith('.d.ts')
 }
+
+function getDaemonContextFingerprint(cwd = process.cwd(), files = DAEMON_CONTEXT_FILES) {
+  const hash = crypto.createHash('sha256')
+  for (const file of files) {
+    hash.update(file)
+    hash.update('\0')
+    try {
+      hash.update(fs.readFileSync(path.join(cwd, file)))
+    } catch {
+      hash.update('<missing>')
+    }
+    hash.update('\0')
+  }
+  return hash.digest('hex')
+}
+
+function daemonContextMatches(runningFingerprint, currentFingerprint) {
+  return typeof runningFingerprint === 'string' && runningFingerprint === currentFingerprint
+}
+
+function isCacheContextCurrent(cache, currentFingerprint) {
+  return cache?.contextFingerprint === currentFingerprint
+}
 // Never descend into dependency trees or build output — they aren't sources and
 // dwarf everything else. (Skipping node_modules also keeps /packages cheap.)
 const PROJECT_SCAN_SKIP_DIRS = new Set([
@@ -565,6 +591,7 @@ async function checkCache() {
   // TTL check
   const age = Date.now() - timestamp
   if (age > CACHE_TTL_MS) return null
+  if (!isCacheContextCurrent(cache.lastRun, getDaemonContextFingerprint())) return null
 
   // File change check
   const currentMtime = await getProjectMtime()
@@ -582,6 +609,7 @@ async function saveCache(output, exitCode, failures, jsonResult = null) {
     lastRun: {
       timestamp: Date.now(),
       projectMtime,
+      contextFingerprint: getDaemonContextFingerprint(),
       output,
       exitCode,
       failures,
@@ -1089,10 +1117,12 @@ async function startDaemon(quiet = false) {
       const out = fs.openSync(logFile, 'a')
       const err = fs.openSync(logFile, 'a')
 
+      const contextFingerprint = getDaemonContextFingerprint()
       const child = spawn('npm', ['run', 'test:daemon'], {
         detached: true,
         stdio: ['ignore', out, err],
         cwd: process.cwd(),
+        env: { ...process.env, [DAEMON_CONTEXT_ENV_VAR]: contextFingerprint },
       })
 
       writePid(child.pid)
@@ -1789,6 +1819,30 @@ function isWedgedEmptyResult(data) {
   return Boolean(data) && typeof data.suitesTotal === 'number' && data.suitesTotal === 0
 }
 
+async function ensureDaemonContextCurrent(quiet = false) {
+  const health = await getHealthJson()
+  if (!health || health.status !== 'ready') return false
+
+  const currentFingerprint = getDaemonContextFingerprint()
+  if (daemonContextMatches(health.contextFingerprint, currentFingerprint)) return false
+
+  const reason = typeof health.contextFingerprint === 'string'
+    ? '.env.test changed'
+    : 'the running daemon predates environment tracking'
+  const message = `${reason}; restarting the test daemon with the current environment...`
+  if (quiet) {
+    console.error(`[test-run] ${message}`)
+  } else {
+    console.log(`${colors.yellow}${message}${colors.reset}`)
+  }
+  await stopDaemon(quiet)
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((await getDaemonStatus()).status === 'down') break
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return true
+}
+
 async function ensureDaemonNotEmpty() {
   const ATTEMPTS = 4
   for (let i = 0; i < ATTEMPTS; i++) {
@@ -1826,6 +1880,8 @@ function reportWedgedEmptyBundle(grep) {
 }
 
 async function runTests() {
+  await ensureDaemonContextCurrent(jsonMode)
+
   // Refuse to serve results from a wedged daemon (stale bundle). See
   // ensureDaemonFresh — a slow-but-healthy rebuild waits, a wedged one reports.
   const freshness = await ensureDaemonFresh()
@@ -2554,6 +2610,9 @@ module.exports = {
   computeStaleBasis,
   computeEffectiveBuiltAt,
   isFreshnessRelevantSourceFile,
+  getDaemonContextFingerprint,
+  daemonContextMatches,
+  isCacheContextCurrent,
   isMissingExactTarget,
   getBundleMtime,
   getProjectMtime,

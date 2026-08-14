@@ -217,6 +217,14 @@ Older daemons that omit `suites`/`suitesTotal` never trigger either path
 (missing data is never escalated to a wedge). Fix a wedge by bouncing the
 daemon: `./scripts/test-run daemon stop` (auto-restarts on the next run).
 
+### Environment context
+
+The daemon inherits `.env.test` only when its process starts. The client hashes
+that file, passes the fingerprint to the daemon, and compares it before each
+run. If `.env.test` changed, the client restarts the daemon before dispatching
+tests. Cached results also include the fingerprint, so a result produced under
+an older environment is never reused.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -224,6 +232,7 @@ daemon: `./scripts/test-run daemon stop` (auto-restarts on the next run).
 | `TEST_PORT` | `9100` | Port for daemon HTTP server |
 | `TEST_DAEMON` | - | Set to any value to enable daemon mode |
 | `TEST_DAEMON_RELOAD_FILE` | `imports/startup/tests/server.ts` | File to touch when triggering a hot reload after Mongo timeouts |
+| `TEST_DAEMON_CONTEXT_FINGERPRINT` | - | Internal value set by `test-run` when it starts the daemon. Do not set it manually. |
 | `TEST_DAEMON_STARTUP_TIMEOUT_MS` | `240000` | Soft per-attempt budget for `meteor test` to reach a serving `/test/health`. After this, the poller keeps waiting only if the daemon log is still being written (forward-progress signal). |
 | `TEST_DAEMON_STARTUP_HARD_TIMEOUT_MS` | `600000` | Hard per-attempt ceiling — even with continuous log activity we never wait longer than this for a single attempt before retrying / failing. |
 
