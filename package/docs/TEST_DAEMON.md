@@ -170,30 +170,43 @@ The `done` event carries two diagnostic counts:
 
 ### Staleness guard
 
-Before dispatching **any** run, the client compares the newest relevant source
-mtime against the daemon's effective build time, and refuses to report results
-when disk is ahead. If a rebuild is merely in flight, the daemon catches up
-within seconds and the run proceeds; if it never catches up within
-`TEST_DAEMON_STALE_WAIT_MS`, the run exits 2 with `stale: true` instead of
-reporting pass/fail for code that never ran.
+Before dispatching **any** run, the client asks the build what it compiled, and
+refuses to report results when disk is ahead of it.
 
-- **Newest relevant source** is the max over `.ts/.tsx/.js/.jsx` files under the
-  bundled roots (`imports`, `server`, `client`, `lib`, `common`, `packages`,
-  `apps`), plus the targeted spec's own mtime when one was given. `node_modules`
-  and build output are skipped, and so are `*.d.ts` — ambient declarations carry
-  no runtime code, so no rebuild is ever triggered by them and including them
-  would produce false alarms.
-- **Effective build time** is `min(builtAt, bundle mtime)`. `builtAt` alone is
-  the *server process boot* time, so a restart that re-executes an unchanged,
-  stale bundle refreshes it and hides the staleness. The emitted
-  `<build-context>/*/server-rspack.js` mtime supplies the missing half; the
-  running code is no newer than either. When no bundle is found (non-rspack app,
-  unknown build context) the check falls back to `builtAt`.
+The build answers through **build stamps**, written by `BuildStampPlugin` in the
+app's `rspack.config.js` on every watch rebuild, next to the bundle:
+
+- `<build-context>/<mode>/.build-stamp-server.json` — the last successful
+  compile: `builtAt`, `newestInputMtime`, `inputCount`, and the `inputs`
+  themselves (`compilation.fileDependencies`, project files only).
+- `<build-context>/<mode>/.build-state-server.json` — what the compiler is doing
+  now: `building`, `ok` or `failed`.
+
+The client stats the recorded inputs. An input now newer than
+`newestInputMtime`, or one that has been deleted, means the daemon is serving a
+stale suite. So does a named target the build has never read — a brand-new spec
+is in no input list until the rebuild that adds it. The client-side stamp is
+ignored on purpose: the daemon runs server tests only, and Tailwind's content
+glob drags `docs/`, `.beads/` and `.claude/` into the client dependency graph.
+
+The wait is bounded by evidence rather than by a fixed budget. While the state
+file says `building`, the client waits for that compile (backstopped by
+`TEST_DAEMON_REBUILD_WAIT_MS`, which only a hung compile reaches). When it says
+otherwise and the bundle is still behind, the watcher never noticed the edit —
+reported after `TEST_DAEMON_WATCH_NOTICE_MS`, so a wedge surfaces in seconds
+instead of minutes.
+
+**No stamp is not "fresh".** An app whose `rspack.config.js` has no
+`BuildStampPlugin` gets `freshness: "unknown"` on every machine-readable payload
+and a warning on the console.
 
 This applies to grep runs, file-targeted runs and bare full runs alike. It used
 to run only for file-targeted (`-f`/path) invocations, which left the everyday
 `test-run <pattern>` and `test-run -t <pattern>` forms reporting confident green
-against a wedged daemon (fo-u728l).
+against a wedged daemon (fo-u728l). Until fo-zdpf0 it also reconstructed the
+input set from a hand-written list of source roots and extensions; any drift
+from rspack's real watch set gave a wrong answer in both directions — false
+wedges that blocked pushes, and the silent opposite.
 
 ### Wedged-empty-bundle detection
 
