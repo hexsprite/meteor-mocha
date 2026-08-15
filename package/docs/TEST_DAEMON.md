@@ -196,6 +196,18 @@ otherwise and the bundle is still behind, the watcher never noticed the edit —
 reported after `TEST_DAEMON_WATCH_NOTICE_MS`, so a wedge surfaces in seconds
 instead of minutes.
 
+Watched directories compare by **listing**, not mtime. Creating and removing a
+scratch file inside one moves its mtime while leaving the listing identical;
+rspack compares contents and does not rebuild, so an mtime check would wait for
+a rebuild that never comes and cry wedged on a healthy daemon. Dotfiles are
+excluded from the listing so a stray `.DS_Store` cannot do the same.
+
+**The guard only applies while a daemon is up.** The stamp is a file, so it
+outlives the process — a stopped daemon plus an edited tree would otherwise read
+as stale forever, and the run would exit 2 before starting the daemon that
+clears it. That would brick `test-run daemon stop && test-run`, the recovery
+path the error message itself recommends.
+
 **No stamp is not "fresh".** An app whose `rspack.config.js` has no
 `BuildStampPlugin` gets `freshness: "unknown"` on every machine-readable payload
 and a warning on the console.

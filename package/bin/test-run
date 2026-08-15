@@ -25,6 +25,7 @@ process.removeAllListeners('warning')
 
 const http = require('http')
 const { spawn, execSync } = require('child_process')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 
@@ -1589,8 +1590,32 @@ function readBuildStamps(cwd = process.cwd(), contextDir = BUILD_CONTEXT_DIR) {
 }
 
 /**
- * Stat every input the build recorded. Returns the newest mtime now on disk
- * and the first recorded input that has since disappeared.
+ * A watched directory's identity: which non-dot names it contains. Must match
+ * hashDirListing in rspack.buildStamp.mjs — the stamp records what the
+ * compiler saw, and this recomputes it.
+ */
+function hashDirListing(dir) {
+  let names
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return null
+  }
+  const visible = names.filter((n) => !n.startsWith('.')).sort()
+  return crypto.createHash('sha1').update(visible.join('\n')).digest('hex')
+}
+
+/**
+ * Compare the whole recorded input set against disk. Returns the newest file
+ * mtime now on disk, the first recorded file that has since disappeared, the
+ * first watched directory whose listing changed, and the first path the build
+ * looked for and did not find that now exists.
+ *
+ * Directories compare by listing rather than mtime on purpose. Creating and
+ * removing a scratch file inside one moves its mtime while leaving the listing
+ * identical; rspack compares contents and does not rebuild, so an mtime check
+ * would wait for a rebuild that never comes and cry wedged on a healthy
+ * daemon — observed on a live daemon while building this.
  */
 function scanStampInputs(stamp, cwd = process.cwd()) {
   let newest = 0
@@ -1603,7 +1628,15 @@ function scanStampInputs(stamp, cwd = process.cwd()) {
       if (!missing) missing = rel
     }
   }
-  return { newest, missing }
+  let changedDir = null
+  for (const [rel, hash] of Object.entries(stamp.dirs || {})) {
+    if (hashDirListing(path.join(cwd, rel)) !== hash) {
+      changedDir = rel
+      break
+    }
+  }
+  const appeared = (stamp.absent || []).find((rel) => fs.existsSync(path.join(cwd, rel)))
+  return { newest, missing, changedDir, appeared: appeared || null }
 }
 
 /**
@@ -1612,11 +1645,21 @@ function scanStampInputs(stamp, cwd = process.cwd()) {
  * `newestInputMtime` is what the compiler saw while reading its inputs, so any
  * recorded input now newer than that was edited after the build. A recorded
  * input that has vanished is stale too — the bundle still contains it.
- * `targetMtime` covers the one case the input list cannot: a file the user
- * named that no build has ever read, such as a brand-new spec.
+ * A path the build looked for and did not find, that now exists, is a change
+ * the input list can never show. `targetMtime` covers the same shape for a
+ * file the user named explicitly.
  */
-function classifyStampFreshness({ stamp, newestOnDisk, missingInput, targetMtime = 0 }) {
+function classifyStampFreshness({
+  stamp,
+  newestOnDisk,
+  missingInput,
+  changedDir,
+  appearedInput,
+  targetMtime = 0,
+}) {
   if (missingInput) return { stale: true, deleted: missingInput }
+  if (changedDir) return { stale: true, changedDir }
+  if (appearedInput) return { stale: true, appeared: appearedInput }
   const newest = Math.max(newestOnDisk, targetMtime)
   if (newest <= stamp.newestInputMtime) return { stale: false }
   return { stale: true, mtimeMs: newest }
@@ -1633,11 +1676,13 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
   let failed = null
   for (const entry of entries) {
     if (entry.state === 'building') building = true
-    const { newest, missing } = scanStampInputs(entry.stamp, cwd)
+    const { newest, missing, changedDir, appeared } = scanStampInputs(entry.stamp, cwd)
     const verdict = classifyStampFreshness({
       stamp: entry.stamp,
       newestOnDisk: newest,
       missingInput: missing,
+      changedDir,
+      appearedInput: appeared,
       targetMtime,
     })
     if (!verdict.stale) continue
@@ -1666,8 +1711,26 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
  * The wait is now bounded by evidence rather than by a fixed budget: while the
  * compiler says `building` we wait for it, and when it says otherwise a stale
  * bundle means the watcher never noticed the edit.
+ *
+ * KNOWN GAP (fo-81ow2): the stamp says what was COMPILED, not what the daemon
+ * is running. Meteor restarts after the compile, so a run dispatched in that
+ * ~10s window reads fresh against the previous bundle. Gating on
+ * `health.builtAt >= stamp.builtAt` was tried and reverted — a
+ * content-identical rebuild advances the stamp without rewriting the bundle,
+ * so Meteor never restarts and the check can never clear. Closing this needs a
+ * build generation both sides can name, not a timestamp.
  */
 async function ensureDaemonFresh() {
+  // Nothing is running, so nothing stale can be served: the guard does not
+  // apply and startup is about to build from current sources anyway.
+  //
+  // This is load-bearing, not an optimisation. The stamp outlives the daemon —
+  // it is a file in the build directory — so a stopped daemon plus an edited
+  // tree reads as stale forever, and the run exits 2 BEFORE it would have
+  // started the daemon that clears it. That bricks `test-run daemon stop &&
+  // test-run`, which is the recovery path this very error message recommends.
+  if (!(await getHealthJson())) return { stale: false }
+
   // filePattern may be a *partial* path — the documented `-f Foo.app-spec.ts`
   // and bare-positional workflows pass a filename the daemon resolves via suite
   // matching, so a direct stat throws. Don't bail to "fresh" in that case: the
@@ -1779,6 +1842,12 @@ function describeStaleness(freshness, pattern) {
   }
   if (freshness.deleted) {
     return `${freshness.deleted} was deleted but is still compiled into ${freshness.bundle}. The daemon is serving a stale suite.`
+  }
+  if (freshness.changedDir) {
+    return `${freshness.changedDir}/ gained or lost a file since ${freshness.bundle} was compiled. The daemon is serving a stale suite.`
+  }
+  if (freshness.appeared) {
+    return `${freshness.appeared} now exists but ${freshness.bundle} was compiled without it. The daemon is serving a stale suite.`
   }
   const lag = Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)
   if (freshness.building) {
@@ -2518,6 +2587,7 @@ module.exports = {
   isMissingExactTarget,
   readBuildStamps,
   scanStampInputs,
+  hashDirListing,
   classifyStampFreshness,
   evaluateStamps,
   describeStaleness,

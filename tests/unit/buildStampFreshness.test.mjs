@@ -20,16 +20,18 @@ const require = createRequire(import.meta.url);
 const {
   classifyStampFreshness,
   evaluateStamps,
+  hashDirListing,
   readBuildStamps,
   scanStampInputs,
   describeStaleness,
 } = require('../../package/bin/test-run');
 
-const stampOf = (newestInputMtime, inputs = []) => ({
+const stampOf = (newestInputMtime, inputs = [], absent = []) => ({
   builtAt: newestInputMtime + 1000,
   newestInputMtime,
   inputCount: inputs.length,
   inputs,
+  absent,
 });
 
 test('fresh when no recorded input is newer than what the compiler saw', () => {
@@ -64,6 +66,20 @@ test('THE GAP: a named target no build has ever read still reports stale', () =>
   });
   assert.equal(verdict.stale, true);
   assert.equal(verdict.mtimeMs, 1500);
+});
+
+test('THE GAP: a path the build looked for and did not find, that now exists, is stale', () => {
+  // A brand-new spec that no run names explicitly. It is in no input list, so
+  // only the compiler's record of what it failed to resolve can catch it.
+  const verdict = classifyStampFreshness({
+    stamp: stampOf(1000),
+    newestOnDisk: 900,
+    appearedInput: 'imports/api/actions/brandNew.app-spec.ts',
+  });
+  assert.deepEqual(verdict, {
+    stale: true,
+    appeared: 'imports/api/actions/brandNew.app-spec.ts',
+  });
 });
 
 test('evaluateStamps: one stale bundle makes the whole daemon stale', () => {
@@ -110,11 +126,68 @@ test('scanStampInputs reads real mtimes and names the first missing input', () =
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-scan-'));
   fs.writeFileSync(path.join(dir, 'present.ts'), 'x');
   const { newest, missing } = scanStampInputs(
-    { inputs: ['present.ts', 'absent.ts'] },
+    { inputs: ['present.ts', 'gone.ts'], absent: [] },
     dir,
   );
   assert.equal(newest, fs.statSync(path.join(dir, 'present.ts')).mtimeMs);
-  assert.equal(missing, 'absent.ts');
+  assert.equal(missing, 'gone.ts');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('THE FALSE WEDGE: a directory whose listing came back is NOT stale', () => {
+  // Observed on a live daemon. A probe file created and deleted inside a
+  // watched directory moves its mtime, but rspack compares listings and does
+  // not rebuild — so an mtime check waits out its budget and reports a wedge
+  // on a perfectly healthy daemon. That is the failure this whole bead exists
+  // to remove, so it must not be reintroduced by the directory signal.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-dir-'));
+  const watched = path.join(dir, 'actions');
+  fs.mkdirSync(watched);
+  fs.writeFileSync(path.join(watched, 'actions.ts'), 'x');
+
+  const stamp = { inputs: [], dirs: { actions: hashDirListing(watched) } };
+  fs.writeFileSync(path.join(watched, 'probe.app-spec.ts'), 'x');
+  assert.equal(scanStampInputs(stamp, dir).changedDir, 'actions', 'new file must be seen');
+  fs.unlinkSync(path.join(watched, 'probe.app-spec.ts'));
+  assert.equal(scanStampInputs(stamp, dir).changedDir, null, 'listing restored, so fresh');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a dotfile appearing does not count as a source change', () => {
+  // .DS_Store must not read as a stale suite — rspack would not rebuild for it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-dir-'));
+  const watched = path.join(dir, 'actions');
+  fs.mkdirSync(watched);
+  fs.writeFileSync(path.join(watched, 'actions.ts'), 'x');
+
+  const stamp = { inputs: [], dirs: { actions: hashDirListing(watched) } };
+  fs.writeFileSync(path.join(watched, '.DS_Store'), 'x');
+  assert.equal(scanStampInputs(stamp, dir).changedDir, null);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a watched directory that vanished is stale', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-dir-'));
+  const stamp = { inputs: [], dirs: { gone: 'somehash' } };
+  assert.equal(scanStampInputs(stamp, dir).changedDir, 'gone');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('scanStampInputs reports an absent path that has since appeared', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-scan-'));
+  fs.writeFileSync(path.join(dir, 'arrived.ts'), 'x');
+  const still = scanStampInputs({ inputs: [], absent: ['nothere.ts'] }, dir);
+  assert.equal(still.appeared, null);
+  const now = scanStampInputs({ inputs: [], absent: ['arrived.ts'] }, dir);
+  assert.equal(now.appeared, 'arrived.ts');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('scanStampInputs tolerates a stamp written before absent was recorded', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-scan-'));
+  assert.equal(scanStampInputs({ inputs: [] }, dir).appeared, null);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
