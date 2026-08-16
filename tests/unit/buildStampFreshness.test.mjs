@@ -20,7 +20,7 @@ const require = createRequire(import.meta.url);
 const {
   classifyStampFreshness,
   evaluateStamps,
-  hashDirListing,
+  hashDirTree,
   readBuildStamps,
   scanStampInputs,
   describeStaleness,
@@ -136,7 +136,7 @@ test('scanStampInputs reads real mtimes and names the first missing input', () =
 
 test('THE FALSE WEDGE: a directory whose listing came back is NOT stale', () => {
   // Observed on a live daemon. A probe file created and deleted inside a
-  // watched directory moves its mtime, but rspack compares listings and does
+  // watched directory moves its mtime, but rspack compares contents and does
   // not rebuild — so an mtime check waits out its budget and reports a wedge
   // on a perfectly healthy daemon. That is the failure this whole bead exists
   // to remove, so it must not be reintroduced by the directory signal.
@@ -145,11 +145,50 @@ test('THE FALSE WEDGE: a directory whose listing came back is NOT stale', () => 
   fs.mkdirSync(watched);
   fs.writeFileSync(path.join(watched, 'actions.ts'), 'x');
 
-  const stamp = { inputs: [], dirs: { actions: hashDirListing(watched) } };
+  const stamp = { inputs: [], dirs: { actions: hashDirTree(watched) } };
   fs.writeFileSync(path.join(watched, 'probe.app-spec.ts'), 'x');
   assert.equal(scanStampInputs(stamp, dir).changedDir, 'actions', 'new file must be seen');
   fs.unlinkSync(path.join(watched, 'probe.app-spec.ts'));
   assert.equal(scanStampInputs(stamp, dir).changedDir, null, 'listing restored, so fresh');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('THE NESTED GAP: a spec added below the watched directory is stale', () => {
+  // rspack forwards a context dependency as a RECURSIVE watch, so `imports`
+  // stands in for everything beneath it and the stamp records only the
+  // outermost directories. Hashing immediate children left a spec two levels
+  // down invisible — verified against a live daemon before the fix, where
+  // creating imports/api/calendar/probe.app-spec.ts still read fresh.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-nested-'));
+  const watched = path.join(dir, 'imports');
+  const deep = path.join(watched, 'api', 'calendar');
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(deep, 'calendar.ts'), 'x');
+
+  const stamp = { inputs: [], dirs: { imports: hashDirTree(watched) } };
+  assert.equal(scanStampInputs(stamp, dir).changedDir, null);
+
+  fs.writeFileSync(path.join(deep, 'probe.app-spec.ts'), 'x');
+  assert.equal(scanStampInputs(stamp, dir).changedDir, 'imports');
+
+  fs.unlinkSync(path.join(deep, 'probe.app-spec.ts'));
+  assert.equal(scanStampInputs(stamp, dir).changedDir, null, 'and back to fresh');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a dependency tree under a watched directory is not a source change', () => {
+  // `meteor npm install` under a watched root must not read as a stale suite.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-nested-'));
+  const watched = path.join(dir, 'packages');
+  fs.mkdirSync(watched, { recursive: true });
+  fs.writeFileSync(path.join(watched, 'thing.ts'), 'x');
+
+  const stamp = { inputs: [], dirs: { packages: hashDirTree(watched) } };
+  fs.mkdirSync(path.join(watched, 'node_modules', 'dep'), { recursive: true });
+  fs.writeFileSync(path.join(watched, 'node_modules', 'dep', 'index.js'), 'x');
+  assert.equal(scanStampInputs(stamp, dir).changedDir, null);
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -161,7 +200,7 @@ test('a dotfile appearing does not count as a source change', () => {
   fs.mkdirSync(watched);
   fs.writeFileSync(path.join(watched, 'actions.ts'), 'x');
 
-  const stamp = { inputs: [], dirs: { actions: hashDirListing(watched) } };
+  const stamp = { inputs: [], dirs: { actions: hashDirTree(watched) } };
   fs.writeFileSync(path.join(watched, '.DS_Store'), 'x');
   assert.equal(scanStampInputs(stamp, dir).changedDir, null);
 

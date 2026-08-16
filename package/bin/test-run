@@ -1589,20 +1589,44 @@ function readBuildStamps(cwd = process.cwd(), contextDir = BUILD_CONTEXT_DIR) {
   return stamps
 }
 
+const SKIP_DIRS = /^(node_modules|_build.*)$/
+
+// Explicit code-unit ordering, mirroring byPath in rspack.buildStamp.mjs. A
+// locale-dependent comparator would make the hash depend on the machine and
+// every run would read stale.
+const byPath = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+
 /**
- * A watched directory's identity: which non-dot names it contains. Must match
- * hashDirListing in rspack.buildStamp.mjs — the stamp records what the
- * compiler saw, and this recomputes it.
+ * A watched directory's identity: every path beneath it. The walk is recursive
+ * because rspack forwards a context dependency as a recursive watch — `imports`
+ * stands in for the whole tree under it, so a shallow listing misses a spec
+ * added two levels down.
+ *
+ * MIRRORED from hashDirTree in the app's rspack.buildStamp.mjs. The stamp
+ * records what the compiler saw and this recomputes it, so the two must agree
+ * exactly or every run reports stale.
  */
-function hashDirListing(dir) {
-  let names
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return null
+function hashDirTree(dir) {
+  const paths = []
+  const walk = (current, prefix) => {
+    let entries
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      if (entry.isDirectory() && SKIP_DIRS.test(entry.name)) continue
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name
+      paths.push(rel)
+      if (entry.isDirectory()) walk(path.join(current, entry.name), rel)
+    }
   }
-  const visible = names.filter((n) => !n.startsWith('.')).sort()
-  return crypto.createHash('sha1').update(visible.join('\n')).digest('hex')
+  if (!fs.existsSync(dir)) return null
+  walk(dir, '')
+  paths.sort(byPath)
+  return crypto.createHash('sha1').update(paths.join('\n')).digest('hex')
 }
 
 /**
@@ -1630,7 +1654,7 @@ function scanStampInputs(stamp, cwd = process.cwd()) {
   }
   let changedDir = null
   for (const [rel, hash] of Object.entries(stamp.dirs || {})) {
-    if (hashDirListing(path.join(cwd, rel)) !== hash) {
+    if (hashDirTree(path.join(cwd, rel)) !== hash) {
       changedDir = rel
       break
     }
@@ -2587,7 +2611,7 @@ module.exports = {
   isMissingExactTarget,
   readBuildStamps,
   scanStampInputs,
-  hashDirListing,
+  hashDirTree,
   classifyStampFreshness,
   evaluateStamps,
   describeStaleness,
