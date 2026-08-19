@@ -463,21 +463,34 @@ function writeCache(data) {
 }
 
 /**
+ * Identity of the bundle(s) a result came from: each server-side build
+ * stamp's builtAt, in stamp order. The result cache is valid for exactly the
+ * bundle that produced it, so a rebuild — the same signal ensureDaemonFresh
+ * trusts — is what invalidates it (fo-jw0z4; mtime scanning left with
+ * fo-zdpf0). No stamps means no provable identity: never cache, never hit.
+ */
+function cacheBuildBasis() {
+  const stamps = readBuildStamps()
+  if (stamps.length === 0) return null
+  return stamps.map((s) => `${s.bundle}:${s.stamp.builtAt}`).join('|')
+}
+
+/**
  * Check if we can use cached result
  */
-async function checkCache() {
+function checkCache() {
   const cache = readCache()
   if (!cache?.lastRun) return null
 
-  const { timestamp, projectMtime, output, exitCode, failures, jsonResult } = cache.lastRun
+  const { timestamp, buildBasis, output, exitCode, failures, jsonResult } = cache.lastRun
 
   // TTL check
   const age = Date.now() - timestamp
   if (age > CACHE_TTL_MS) return null
 
-  // File change check
-  const currentMtime = await getProjectMtime()
-  if (currentMtime > projectMtime) return null
+  // Rebuild check
+  const currentBasis = cacheBuildBasis()
+  if (!currentBasis || currentBasis !== buildBasis) return null
 
   return { output, exitCode, failures, age, jsonResult }
 }
@@ -485,12 +498,20 @@ async function checkCache() {
 /**
  * Save result to cache
  */
-async function saveCache(output, exitCode, failures, jsonResult = null) {
-  const projectMtime = await getProjectMtime()
+function saveCache(output, exitCode, failures, jsonResult = null) {
+  // Best-effort: a failed cache write must not kill the client mid-stream.
+  try {
+    writeCacheEntry(output, exitCode, failures, jsonResult)
+  } catch {
+    // ignore cache errors
+  }
+}
+
+function writeCacheEntry(output, exitCode, failures, jsonResult) {
   writeCache({
     lastRun: {
       timestamp: Date.now(),
-      projectMtime,
+      buildBasis: cacheBuildBasis(),
       output,
       exitCode,
       failures,
@@ -1960,7 +1981,6 @@ async function runTests() {
   let exitCode = 0
   let outputBuffer = ''
   let failureCount = 0
-  let cachePromise = null
   let retrying = false
   let jsonResult = null // Parsed JSON from Mocha reporter
   let startTime = Date.now()
@@ -2352,9 +2372,9 @@ async function runTests() {
           }
         }
 
-        // Save to cache for full runs (store promise to await later)
+        // Save to cache for full runs
         if (isFullRun) {
-          cachePromise = saveCache(outputBuffer, exitCode, failureCount, jsonResult)
+          saveCache(outputBuffer, exitCode, failureCount, jsonResult)
         }
         break
 
@@ -2514,9 +2534,6 @@ async function runTests() {
       if (retrying) return
 
       // Wait for cache to be saved before exiting
-      if (cachePromise) {
-        await cachePromise.catch(() => {}) // Ignore cache errors
-      }
 
       if (watchMode) {
         // Watch mode: wait for daemon restart, then re-run
@@ -2617,4 +2634,7 @@ module.exports = {
   describeStaleness,
   classifyDaemonFullness,
   isWedgedEmptyResult,
+  cacheBuildBasis,
+  checkCache,
+  saveCache,
 }
