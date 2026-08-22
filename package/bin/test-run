@@ -1939,10 +1939,10 @@ async function runTests() {
     return
   }
 
-  // Check cache for full test runs (no grep, no file filter, no invert)
-  // The cache is keyed to the server build stamp, so a rebuild invalidates it.
-  // An edit that never reaches a rebuild does not, which is why this is only
-  // consulted for a full run.
+  // Only a full run is ever saved, so a grep or file-filtered query cannot be
+  // served from the cache whatever its age. That is what this gate is for.
+  // Staleness is separate: the cache is keyed to the server build stamp, so a
+  // rebuild invalidates it.
   const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
   const noCache = args.includes('--no-cache')
 
