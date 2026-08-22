@@ -472,7 +472,13 @@ function writeCache(data) {
 function cacheBuildBasis() {
   const stamps = readBuildStamps()
   if (stamps.length === 0) return null
-  return stamps.map((s) => `${s.bundle}:${s.stamp.builtAt}`).join('|')
+  // Sorted for the same reason hashDirTree sorts: readBuildStamps walks the
+  // mode directories with readdirSync, and an order change between save and
+  // check would read as a different build and miss the cache.
+  return stamps
+    .map((s) => `${s.bundle}:${s.stamp.builtAt}`)
+    .sort()
+    .join('|')
 }
 
 /**
@@ -1934,7 +1940,9 @@ async function runTests() {
   }
 
   // Check cache for full test runs (no grep, no file filter, no invert)
-  // Cache checks file mtimes, so changed files will invalidate it automatically
+  // The cache is keyed to the server build stamp, so a rebuild invalidates it.
+  // An edit that never reaches a rebuild does not, which is why this is only
+  // consulted for a full run.
   const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
   const noCache = args.includes('--no-cache')
 
@@ -2532,8 +2540,6 @@ async function runTests() {
 
       // If retrying due to "already running", don't exit
       if (retrying) return
-
-      // Wait for cache to be saved before exiting
 
       if (watchMode) {
         // Watch mode: wait for daemon restart, then re-run

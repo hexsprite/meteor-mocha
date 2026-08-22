@@ -67,3 +67,22 @@ test('a legacy projectMtime cache entry is treated as stale', () => {
   );
   assert.equal(checkCache(), null);
 });
+
+test('the build basis does not change with directory listing order', () => {
+  // readBuildStamps walks the mode directories with readdirSync, which makes
+  // no ordering promise. Unsorted, the same bundle set could produce two
+  // different basis strings and miss its own cache. Created in reverse order
+  // here so a filesystem that returns insertion order (CI is Linux; macOS
+  // APFS happens to sort) reproduces it.
+  fs.rmSync(path.join(tmp, '_build-daemon'), { recursive: true, force: true });
+  for (const mode of ['zzz', 'aaa']) {
+    const dir = path.join(tmp, '_build-daemon', mode);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.build-stamp-server.json'),
+      JSON.stringify({ builtAt: 1000, newestInputMtime: 0, inputCount: 1, inputs: ['imports/x.ts'] })
+    );
+  }
+
+  assert.equal(cacheBuildBasis(), 'aaa/server:1000|zzz/server:1000');
+});
