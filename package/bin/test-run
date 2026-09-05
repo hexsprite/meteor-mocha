@@ -1011,9 +1011,6 @@ function captureDiagnosticSnapshot(label, daemonPid) {
   return snapshot
 }
 
-// Reap this machine's own orphaned meteor-test-run* build dirs older than
-// STALE_TEMP_DIR_MAX_AGE_MS. Injectable for tests (fsImpl/tmpDir/now) so the
-// unit test never touches the real OS tmpdir.
 // fo-fxz1c review (pullfrog): age alone does not prove a dir is orphaned.
 // Separate worktrees run independent daemons sharing this OS tmpdir, and a
 // daemon that has simply been idle (no test runs) for longer than maxAgeMs
@@ -1022,12 +1019,20 @@ function captureDiagnosticSnapshot(label, daemonPid) {
 // process has the dir's files open (POSIX unlink succeeds regardless), so
 // the try/catch this used to rely on for "leave it if it's in use" never
 // actually protected anything. Check real liveness via lsof instead.
+// fo-fxz1c review (pullfrog, round 2): a probe that could not COMPLETE must
+// not read the same as a probe that completed and found nothing — the first
+// is "we don't know," the second is "confirmed unused," and only the second
+// may authorize deletion. execFileSync distinguishes the two in the error it
+// throws: a spawn failure (missing lsof binary) sets `err.code === 'ENOENT'`
+// with no `.status`; a timeout kill sets `err.signal`; a normal nonzero exit
+// (lsof ran, found nothing) sets `err.status` to a number and leaves
+// `err.code`/`err.signal` unset. Only the last of these means "confirmed
+// unused" — the first two fail CLOSED (report in-use, skip deletion).
 function isDirInUse(dirPath, { execFileSyncImpl = execFileSync } = {}) {
-  // lsof's EXIT CODE is not the "found something" signal: a `+D` recursive
-  // scan exits 1 on a permission-denied subdirectory it merely warned about,
-  // even when it found and printed real open-file rows for the path we
-  // actually asked about. Only stdout content (empty vs not) distinguishes
-  // "nothing has this open" from "something does" — checked in both the
+  // lsof's EXIT CODE is not the "found something" signal on its own: a `+D`
+  // recursive scan exits 1 on a permission-denied subdirectory it merely
+  // warned about, even when it found and printed real open-file rows for the
+  // path we actually asked about. Stdout content is checked in both the
   // success and thrown-error paths, since execFileSync still attaches
   // `.stdout` to the error it throws on a non-zero exit.
   try {
@@ -1038,10 +1043,15 @@ function isDirInUse(dirPath, { execFileSyncImpl = execFileSync } = {}) {
     })
     return out.trim().length > 0
   } catch (err) {
-    return Boolean(err.stdout && err.stdout.trim().length > 0)
+    if (err.stdout && err.stdout.trim().length > 0) return true
+    if (err.code === 'ENOENT' || err.signal) return true // couldn't complete — fail closed
+    return false // ran, exited nonzero, no output — confirmed nothing has it open
   }
 }
 
+// Reap this machine's own orphaned meteor-test-run* build dirs older than
+// STALE_TEMP_DIR_MAX_AGE_MS. Injectable for tests (fsImpl/tmpDir/now) so the
+// unit test never touches the real OS tmpdir.
 function reapStaleTempDirs({
   tmpDir = os.tmpdir(),
   maxAgeMs = STALE_TEMP_DIR_MAX_AGE_MS,
