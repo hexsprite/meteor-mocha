@@ -512,9 +512,13 @@ function checkCache() {
 }
 
 /**
- * Save result to cache
+ * Save result to cache. A failing run is never cached (fo-bhgu): a flaky
+ * timeout or transient failure would otherwise be replayed as a cache hit for
+ * up to CACHE_TTL_MS even after the underlying issue clears, and there is no
+ * legitimate reason to skip re-running tests that just failed.
  */
 function saveCache(output, exitCode, failures, jsonResult = null) {
+  if (exitCode !== 0) return
   // Best-effort: a failed cache write must not kill the client mid-stream.
   try {
     writeCacheEntry(output, exitCode, failures, jsonResult)
