@@ -50,6 +50,26 @@ test('cached result round-trips while the bundle is unchanged', () => {
   assert.deepEqual(hit.jsonResult, { stats: { passes: 5 } });
 });
 
+// fo-bhgu: a flaky/failing run must never be cached. Caching failures meant a
+// transient timeout, once cached, kept being replayed as a failure for up to
+// CACHE_TTL_MS even after the underlying issue cleared.
+test('a failing run (non-zero exitCode) is never cached', () => {
+  writeStamp(3000); // basis unique to this test, isolated from the others
+  saveCache('boom', 1, 3, { stats: { failures: 3 } });
+  assert.equal(checkCache(), null, 'a failed run must not be replayed as a cache hit');
+});
+
+// Pullfrog finding on PR #1471: a forced fresh run (--no-cache) exposing a
+// failure must invalidate the prior successful entry too, not just decline to
+// overwrite it -- otherwise the next ordinary run replays that older success
+// as a false green even though the failure was never cached itself.
+test('a failure invalidates an existing successful cache entry for the same basis', () => {
+  writeStamp(4000); // basis unique to this test, isolated from the others
+  saveCache('all green', 0, 0, { stats: { passes: 5 } });
+  saveCache('boom', 1, 3, { stats: { failures: 3 } }); // same build basis
+  assert.equal(checkCache(), null, 'the stale successful entry must not be replayed');
+});
+
 test('a rebuild invalidates the cache', () => {
   writeStamp(1000);
   saveCache('stale soon', 0, 0, null);
