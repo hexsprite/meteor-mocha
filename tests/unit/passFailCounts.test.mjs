@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { derivePassFailCounts, summarizeFailures } = require('../../package/bin/test-run');
+const { derivePassFailCounts, summarizeFailures, finalizeJsonOutput } = require('../../package/bin/test-run');
 
 test('reads passed/failed straight off stats when both are numbers', () => {
   const output = { stats: { tests: 10, passes: 8, failures: 2, pending: 0 } };
@@ -54,4 +54,29 @@ test('derived passed never goes negative when stats disagree with the failures a
   const { passed, failed } = derivePassFailCounts(output, failureSummary);
   assert.equal(failed, 3);
   assert.equal(passed, 0); // 1 - 3 clamps to 0, not -2
+});
+
+// The above cases only exercise derivePassFailCounts directly -- they'd stay
+// green even if finalizeJsonOutput never wired .passed/.failed onto the
+// public JSON payload. These go through the actual public contract.
+test('finalizeJsonOutput exposes top-level passed/failed for a passing result', () => {
+  const output = { success: true, stats: { tests: 3, passes: 3, failures: 0, pending: 0 }, failures: [] };
+
+  const result = finalizeJsonOutput(output);
+
+  assert.equal(result.passed, 3);
+  assert.equal(result.failed, 0);
+});
+
+test('finalizeJsonOutput exposes top-level passed/failed for a failing result', () => {
+  const output = {
+    success: false,
+    stats: { tests: 3, passes: 1, failures: 2, pending: 0 },
+    failures: [{ title: 'a' }, { title: 'b' }],
+  };
+
+  const result = finalizeJsonOutput(output);
+
+  assert.equal(result.passed, 1);
+  assert.equal(result.failed, 2);
 });
