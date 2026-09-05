@@ -354,8 +354,10 @@ function acquireLock() {
     if (age < LOCK_STALE_MS && isProcessRunning(pid)) {
       return false // Lock is held by another process
     }
-    // Stale lock - we can take over
-    console.log(`${colors.dim}Cleaning up stale lock file${colors.reset}`)
+    // Stale lock - we can take over. stderr, not stdout: the pre-push hook
+    // pipes `test-run --json` stdout straight into jq, and this ran
+    // unconditionally on stdout regardless of --json (fo-754ok).
+    console.error(`${colors.dim}Cleaning up stale lock file${colors.reset}`)
   } catch {
     // No lock file or invalid - we can acquire
   }
@@ -2615,6 +2617,7 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  acquireLock,
   createJsonProgressLogger,
   createRestartLoopTracker,
   shouldReportNoTestsMatched,
