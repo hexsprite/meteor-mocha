@@ -27,6 +27,7 @@ const http = require('http')
 const { spawn, execSync } = require('child_process')
 const crypto = require('crypto')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 
 const port = process.env.TEST_PORT || 9100
@@ -35,6 +36,12 @@ const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
 const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
 const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
 const CACHE_TTL_MS = 60000 // 1 minute
+// fo-fxz1c: a killed daemon orphans its meteor-test-run* build dir under the
+// OS tmpdir (~300MB each) and nothing else ever reaps them — 24 dirs / 5GB
+// measured in one session. Age-gated (not "every dir not ours") so a
+// concurrently-running daemon's own live dir, started moments ago, is never
+// touched by another daemon's startup reap.
+const STALE_TEMP_DIR_MAX_AGE_MS = Number(process.env.TEST_RUN_STALE_TEMP_DIR_MAX_AGE_MS) || 4 * 60 * 60 * 1000
 const HEALTH_CHECK_TIMEOUT_MS = 2000
 const RESTART_WAIT_TIMEOUT_MS = 120000
 const DEFAULT_HOT_RELOAD_FILE = path.join(
@@ -1004,6 +1011,46 @@ function captureDiagnosticSnapshot(label, daemonPid) {
   return snapshot
 }
 
+// Reap this machine's own orphaned meteor-test-run* build dirs older than
+// STALE_TEMP_DIR_MAX_AGE_MS. Injectable for tests (fsImpl/tmpDir/now) so the
+// unit test never touches the real OS tmpdir.
+function reapStaleTempDirs({
+  tmpDir = os.tmpdir(),
+  maxAgeMs = STALE_TEMP_DIR_MAX_AGE_MS,
+  now = Date.now,
+  fsImpl = fs,
+  quiet = false,
+} = {}) {
+  const reaped = []
+  let entries
+  try {
+    entries = fsImpl.readdirSync(tmpDir)
+  } catch {
+    return reaped
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith('meteor-test-run')) continue
+    const fullPath = path.join(tmpDir, entry)
+    let stat
+    try {
+      stat = fsImpl.statSync(fullPath)
+    } catch {
+      continue
+    }
+    if (now() - stat.mtime.getTime() < maxAgeMs) continue
+    try {
+      fsImpl.rmSync(fullPath, { recursive: true, force: true })
+      reaped.push(fullPath)
+    } catch {
+      // Another process may hold it open (a live daemon) — leave it.
+    }
+  }
+  if (!quiet && reaped.length > 0) {
+    console.log(`${colors.dim}Reaped ${reaped.length} stale meteor-test-run* dir(s) from a prior daemon${colors.reset}`)
+  }
+  return reaped
+}
+
 // Start daemon in background
 async function startDaemon(quiet = false) {
   // Check if already running
@@ -1049,6 +1096,8 @@ async function startDaemon(quiet = false) {
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true })
     }
+
+    reapStaleTempDirs({ quiet })
 
     logDaemonEvent('startup-begin', {
       pid_file: pidFile,
@@ -1286,6 +1335,69 @@ async function startDaemon(quiet = false) {
   }
 }
 
+function getPortBoundPids(targetPort = port) {
+  try {
+    const result = execSync(`lsof -ti:${targetPort} 2>/dev/null || true`).toString().trim()
+    return result
+      ? result.split('\n').map((p) => parseInt(p, 10)).filter(Number.isFinite)
+      : []
+  } catch {
+    return []
+  }
+}
+
+function describeProcess(pid) {
+  try {
+    return execSync(`ps -o comm= -p ${pid} 2>/dev/null || true`).toString().trim() || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+// Poll (bounded) for the daemon's tracked pid to die AND the port to clear
+// before letting the caller report success. fo-fxz1c: `daemon stop` used to
+// print "Daemon stopped" right after sending SIGTERM while 8 children (the
+// daemon, mongo, 4x daemon-watcher) kept running and holding the port — the
+// next cold start then failed until each PID was killed by hand. Injectable
+// for tests (isAlive/portBoundPids/sleep) so this never spawns a real daemon.
+async function waitForTermination({
+  pid,
+  timeoutMs = 5000,
+  pollMs = 200,
+  isAlive = isProcessRunning,
+  portBoundPids = getPortBoundPids,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs))
+  let stillAlive = pid ? isAlive(pid) : false
+  let stillBound = portBoundPids()
+  for (
+    let attempt = 0;
+    (stillAlive || stillBound.length > 0) && attempt < maxAttempts;
+    attempt++
+  ) {
+    await sleep(pollMs)
+    stillAlive = pid ? isAlive(pid) : false
+    stillBound = portBoundPids()
+  }
+  const alivePids = []
+  if (stillAlive) alivePids.push(pid)
+  for (const p of stillBound) {
+    if (!alivePids.includes(p)) alivePids.push(p)
+  }
+  return { stopped: alivePids.length === 0, alivePids }
+}
+
+function reportStopResult(result, quiet) {
+  if (quiet) return
+  if (result.stopped) {
+    console.log(`${colors.green}Daemon stopped${colors.reset}`)
+    return
+  }
+  const roles = result.alivePids.map((p) => `${p} (${describeProcess(p)})`).join(', ')
+  console.log(`${colors.red}Daemon did not fully stop — still alive: ${roles}${colors.reset}`)
+}
+
 // Stop daemon
 async function stopDaemon(quiet = false) {
   const pid = readPid()
@@ -1296,9 +1408,7 @@ async function stopDaemon(quiet = false) {
     // Kill the process group to get all child processes
     terminateProcess(pid)
     removePid()
-    if (!quiet) {
-      console.log(`${colors.green}Daemon stopped${colors.reset}`)
-    }
+    reportStopResult(await waitForTermination({ pid }), quiet)
   } else {
     // Try to find and kill by port
     try {
@@ -1316,9 +1426,7 @@ async function stopDaemon(quiet = false) {
           }
         }
         removePid()
-        if (!quiet) {
-          console.log(`${colors.green}Daemon stopped${colors.reset}`)
-        }
+        reportStopResult(await waitForTermination({ pid: null }), quiet)
       } else {
         if (!quiet) {
           console.log(`${colors.dim}No daemon running${colors.reset}`)
@@ -2696,4 +2804,6 @@ module.exports = {
   cacheBuildBasis,
   checkCache,
   saveCache,
+  reapStaleTempDirs,
+  waitForTermination,
 }
