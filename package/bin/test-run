@@ -24,7 +24,7 @@ process.removeAllListeners('warning')
  */
 
 const http = require('http')
-const { spawn, execSync } = require('child_process')
+const { spawn, execSync, execFileSync } = require('child_process')
 const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
@@ -1014,11 +1014,40 @@ function captureDiagnosticSnapshot(label, daemonPid) {
 // Reap this machine's own orphaned meteor-test-run* build dirs older than
 // STALE_TEMP_DIR_MAX_AGE_MS. Injectable for tests (fsImpl/tmpDir/now) so the
 // unit test never touches the real OS tmpdir.
+// fo-fxz1c review (pullfrog): age alone does not prove a dir is orphaned.
+// Separate worktrees run independent daemons sharing this OS tmpdir, and a
+// daemon that has simply been idle (no test runs) for longer than maxAgeMs
+// still owns its dir — deleting it out from under a live process would break
+// that worktree's next test run. `rmSync` does NOT fail just because a
+// process has the dir's files open (POSIX unlink succeeds regardless), so
+// the try/catch this used to rely on for "leave it if it's in use" never
+// actually protected anything. Check real liveness via lsof instead.
+function isDirInUse(dirPath, { execFileSyncImpl = execFileSync } = {}) {
+  // lsof's EXIT CODE is not the "found something" signal: a `+D` recursive
+  // scan exits 1 on a permission-denied subdirectory it merely warned about,
+  // even when it found and printed real open-file rows for the path we
+  // actually asked about. Only stdout content (empty vs not) distinguishes
+  // "nothing has this open" from "something does" — checked in both the
+  // success and thrown-error paths, since execFileSync still attaches
+  // `.stdout` to the error it throws on a non-zero exit.
+  try {
+    const out = execFileSyncImpl('lsof', ['+D', dirPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    })
+    return out.trim().length > 0
+  } catch (err) {
+    return Boolean(err.stdout && err.stdout.trim().length > 0)
+  }
+}
+
 function reapStaleTempDirs({
   tmpDir = os.tmpdir(),
   maxAgeMs = STALE_TEMP_DIR_MAX_AGE_MS,
   now = Date.now,
   fsImpl = fs,
+  isInUse = isDirInUse,
   quiet = false,
 } = {}) {
   const reaped = []
@@ -1038,11 +1067,13 @@ function reapStaleTempDirs({
       continue
     }
     if (now() - stat.mtime.getTime() < maxAgeMs) continue
+    if (isInUse(fullPath)) continue
     try {
       fsImpl.rmSync(fullPath, { recursive: true, force: true })
       reaped.push(fullPath)
     } catch {
-      // Another process may hold it open (a live daemon) — leave it.
+      // Removed or permission-denied between the stat and the rm — fine,
+      // nothing to reap either way.
     }
   }
   if (!quiet && reaped.length > 0) {
@@ -1398,45 +1429,62 @@ function reportStopResult(result, quiet) {
   console.log(`${colors.red}Daemon did not fully stop — still alive: ${roles}${colors.reset}`)
 }
 
-// Stop daemon
-async function stopDaemon(quiet = false) {
-  const pid = readPid()
-  if (pid && isProcessRunning(pid)) {
+// Stop daemon. Returns true when nothing is left running (or nothing was
+// running to begin with), false when the process/port could not be
+// confirmed clear within the timeout — callers (the CLI `stop` command,
+// `restart`) must not treat this as success (fo-fxz1c review, pullfrog).
+// `deps` is test-only injection (default to the real implementations) so
+// this can be exercised without spawning a real daemon.
+async function stopDaemon(quiet = false, deps = {}) {
+  const {
+    readPid: readPidImpl = readPid,
+    isProcessRunning: isProcessRunningImpl = isProcessRunning,
+    terminateProcess: terminateProcessImpl = terminateProcess,
+    removePid: removePidImpl = removePid,
+    waitForTermination: waitForTerminationImpl = waitForTermination,
+    execSync: execSyncImpl = execSync,
+  } = deps
+  const pid = readPidImpl()
+  if (pid && isProcessRunningImpl(pid)) {
     if (!quiet) {
       console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
     }
     // Kill the process group to get all child processes
-    terminateProcess(pid)
-    removePid()
-    reportStopResult(await waitForTermination({ pid }), quiet)
-  } else {
-    // Try to find and kill by port
-    try {
-      const result = execSync(`lsof -ti:${port}`).toString().trim()
-      if (result) {
-        const pids = result.split('\n')
-        for (const p of pids) {
-          try {
-            process.kill(parseInt(p, 10), 'SIGTERM')
-            if (!quiet) {
-              console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
-            }
-          } catch {
-            // Process already dead
+    terminateProcessImpl(pid)
+    removePidImpl()
+    const result = await waitForTerminationImpl({ pid })
+    reportStopResult(result, quiet)
+    return result.stopped
+  }
+  // Try to find and kill by port
+  try {
+    const result = execSyncImpl(`lsof -ti:${port}`).toString().trim()
+    if (result) {
+      const pids = result.split('\n')
+      for (const p of pids) {
+        try {
+          process.kill(parseInt(p, 10), 'SIGTERM')
+          if (!quiet) {
+            console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
           }
-        }
-        removePid()
-        reportStopResult(await waitForTermination({ pid: null }), quiet)
-      } else {
-        if (!quiet) {
-          console.log(`${colors.dim}No daemon running${colors.reset}`)
+        } catch {
+          // Process already dead
         }
       }
-    } catch {
-      if (!quiet) {
-        console.log(`${colors.dim}No daemon running${colors.reset}`)
-      }
+      removePidImpl()
+      const termination = await waitForTerminationImpl({ pid: null })
+      reportStopResult(termination, quiet)
+      return termination.stopped
     }
+    if (!quiet) {
+      console.log(`${colors.dim}No daemon running${colors.reset}`)
+    }
+    return true
+  } catch {
+    if (!quiet) {
+      console.log(`${colors.dim}No daemon running${colors.reset}`)
+    }
+    return true
   }
 }
 
@@ -1484,19 +1532,23 @@ async function handleDaemonCommand(cmd) {
       process.exit(0)
       break
     case 'stop':
-      await stopDaemon()
-      process.exit(0)
+      process.exit((await stopDaemon()) ? 0 : 1)
       break
     case 'status':
       await daemonStatus()
       process.exit(0)
       break
-    case 'restart':
-      await stopDaemon()
+    case 'restart': {
+      const stopped = await stopDaemon()
+      if (!stopped) {
+        console.error(`${colors.red}Refusing to start a replacement daemon — the prior one did not fully stop${colors.reset}`)
+        process.exit(1)
+      }
       await new Promise(r => setTimeout(r, 1000))
       await startDaemon()
       process.exit(0)
       break
+    }
     case 'logs':
       const tailMode = args.includes('-t') || args.includes('--tail')
       if (fs.existsSync(logFile)) {
@@ -2805,5 +2857,7 @@ module.exports = {
   checkCache,
   saveCache,
   reapStaleTempDirs,
+  isDirInUse,
   waitForTermination,
+  stopDaemon,
 }
