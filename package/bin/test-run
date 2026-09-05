@@ -68,7 +68,15 @@ const errorLineSnippets = [
   'heap out of memory',
 ]
 
+// Lines that contain an error-shaped snippet above but are not fatal to the
+// daemon. macOS logs 'Failed to start watcher for <path>: [Error: Error
+// starting FSEvents stream]' when a watcher can't attach under load — the
+// daemon keeps running and rebuilds normally, but the bare 'Error' snippet
+// above would otherwise score it as the crash (fo-a3v67).
+const benignLineSnippets = ['Failed to start watcher for']
+
 function isDaemonErrorLine(line) {
+  if (benignLineSnippets.some(snippet => line.includes(snippet))) return false
   return errorLineSnippets.some(snippet => line.includes(snippet))
 }
 
@@ -2629,6 +2637,7 @@ module.exports = {
   isActivityEvent,
   parseDaemonHealthResponse,
   isMongoTimeoutMessage,
+  isDaemonErrorLine,
   touchHotReloadFile,
   waitForDaemonRestart,
   isMissingExactTarget,
