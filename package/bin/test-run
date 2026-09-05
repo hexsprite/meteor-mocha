@@ -787,12 +787,36 @@ function buildLlmSummary(output, failureSummary) {
   return lines.join('\n')
 }
 
+/**
+ * Stable top-level pass/fail counts, always integers. `.stats.passes`/
+ * `.stats.failures` are authoritative when the mocha JSON reporter populated
+ * them; when it didn't (an error path, or a malformed/partial payload), fall
+ * back to the parsed failures array (and a clamped tests - failed - pending
+ * derivation for passed) so the fields are never null.
+ */
+function derivePassFailCounts(output, failureSummary) {
+  const stats = output?.stats
+  const failed = typeof stats?.failures === 'number' ? stats.failures : failureSummary.total
+  const passed = typeof stats?.passes === 'number'
+    ? stats.passes
+    : Math.max(
+      0,
+      (typeof stats?.tests === 'number' ? stats.tests : 0) -
+        failed -
+        (typeof stats?.pending === 'number' ? stats.pending : 0),
+    )
+  return { passed, failed }
+}
+
 function finalizeJsonOutput(output, options = {}) {
   const failureSummary = summarizeFailures(output.failures, options)
   const summary = buildLlmSummary(output, failureSummary)
+  const { passed, failed } = derivePassFailCounts(output, failureSummary)
 
   return {
     ...output,
+    passed,
+    failed,
     llm_summary: summary,
     llm_failures: failureSummary.items,
     llm_failures_total: failureSummary.total,
@@ -2650,6 +2674,7 @@ module.exports = {
   extractMochaJsonFromMixedOutput,
   summarizeFailures,
   buildLlmSummary,
+  derivePassFailCounts,
   finalizeJsonOutput,
   formatMachineOutput,
   printMachineOutput,
