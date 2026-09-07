@@ -82,6 +82,32 @@ test('isDirInUse reads false from a nonzero exit with no rows (nothing has it op
   assert.equal(inUse, false);
 });
 
+// pullfrog round 2 on PR #1510: a probe that could not COMPLETE (missing
+// binary, timeout) must not read the same as one that completed and found
+// nothing — the prior version mapped both to "unused," which could delete a
+// directory the probe never actually got to check.
+test('isDirInUse fails closed (reports in-use) when the lsof binary is missing', () => {
+  const inUse = isDirInUse('/tmp/whatever', {
+    execFileSyncImpl: () => {
+      const err = new Error('spawn lsof ENOENT');
+      err.code = 'ENOENT';
+      throw err;
+    },
+  });
+  assert.equal(inUse, true);
+});
+
+test('isDirInUse fails closed (reports in-use) when the lsof call times out', () => {
+  const inUse = isDirInUse('/tmp/whatever', {
+    execFileSyncImpl: () => {
+      const err = new Error('Command timed out');
+      err.signal = 'SIGTERM';
+      throw err;
+    },
+  });
+  assert.equal(inUse, true);
+});
+
 test('reapStaleTempDirs leaves a stale-by-age dir alone when a live process still has it open', () => {
   // A daemon in another worktree can sit idle (no test runs) for longer than
   // maxAgeMs while still owning its dir — age alone must not authorize
