@@ -16,11 +16,31 @@
 // automatically, with no human confirming intent, so a reused pidfile PID
 // could signal an unrelated process group.
 //
-// The fix has two tiers. A port holder is authoritative: trust the pidfile
-// PID only when it IS the port holder, veto it the instant a different pid
-// holds the port. With NO port holder at all (a crashed daemon whose
-// listener already dropped, or nothing running), absence of a port holder
-// is absence of evidence, not evidence of identity — an earlier version of
+// The fix has two tiers. A port LISTENER is authoritative, but a raw pid
+// match is the wrong comparison: startDaemon spawns the pidfile pid
+// (`npm run test:daemon`) with `detached: true`, so it becomes a process
+// group leader, and the process that actually binds the port is its
+// grandchild — a DIFFERENT pid that never appears in the pidfile. Confirmed
+// live: pidfile pid 22175, listener pid 22237, three levels apart in the
+// same process tree, both sharing pgid 22175. A raw-pid identity check
+// (`portHolderPids.includes(pidfilePid)`) is false for every healthy daemon,
+// by construction — the "verified" branch was unreachable, so stopDaemon
+// ALWAYS fell to the unverified fallback below, which SIGTERMs each port
+// holder individually rather than by group. Worse: the old lookup
+// (`lsof -ti:<port>`, no `-sTCP:LISTEN`) also matched CLIENT sockets on that
+// port, and this harness's own test-runner process is one — its
+// health()/fileMap() helpers fetch the daemon in-process. That let the
+// "unverifiable, kill every port holder" fallback SIGTERM the test runner
+// itself mid-suite (fo-pi0kl: the observed `signal: 'SIGTERM'` file-level
+// failure, no assertion, no test name — the process died, not a test).
+//
+// The fix: compare process GROUPS, not pids. `getPortHolderPids` now scopes
+// to `-sTCP:LISTEN` so a client socket is never even a candidate. Trust the
+// pidfile pid only when some listener shares its pgid — true for a real
+// daemon's own descendants, false for an unrelated client or a
+// kernel-recycled pid. With NO listener at all (a crashed daemon whose
+// listener already dropped, or nothing running), absence of a listener is
+// absence of evidence, not evidence of identity — an earlier version of
 // this fix trusted the pidfile PID blindly in that case, which is exactly
 // the scenario stop-stale-daemon.sh says is the common one (no daemon
 // running, a leftover pidfile, PID recycled onto someone else's process).
@@ -35,23 +55,35 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { stopDaemon, pidfileIdentityVerified, looksLikeDaemonProcess } = require('../../package/bin/test-run');
 
-test('predicate: pidfile PID among the port holders is trusted regardless of command line', () => {
-  assert.equal(pidfileIdentityVerified(4242, [111, 4242], null), true);
+test('predicate: a listener sharing the pidfile pid\'s process group is trusted regardless of command line', () => {
+  // The real shape: pidfile pid is the group leader (its own pgid), the
+  // listener is some other pid but inherits that same pgid.
+  assert.equal(pidfileIdentityVerified(4242, [9999, 4242], null), true);
 });
 
-test('predicate: a DIFFERENT pid holding the port vetoes the pidfile PID regardless of command line', () => {
+test('predicate: a listener in a DIFFERENT process group vetoes the pidfile pid regardless of command line', () => {
   assert.equal(pidfileIdentityVerified(4242, [111], 'npm run test:daemon'), false);
 });
 
-test('predicate: no port holder, command line looks like the daemon — trusted', () => {
+test('predicate: the pidfile pid itself as a listener group id (own pgid) is trusted', () => {
+  // startDaemon's spawn makes the pidfile pid its own group leader, so its
+  // pgid literally equals its pid when nothing renumbers it.
+  assert.equal(pidfileIdentityVerified(4242, [4242], null), true);
+});
+
+test('predicate: pidfile group id unknown (ps failed) vetoes even with a listener present', () => {
+  assert.equal(pidfileIdentityVerified(null, [4242], 'npm run test:daemon'), false);
+});
+
+test('predicate: no listener, command line looks like the daemon — trusted', () => {
   assert.equal(pidfileIdentityVerified(4242, [], 'npm run test:daemon'), true);
 });
 
-test('predicate: no port holder, command line does not look like the daemon — vetoed', () => {
+test('predicate: no listener, command line does not look like the daemon — vetoed', () => {
   assert.equal(pidfileIdentityVerified(4242, [], 'node some-unrelated-script.js'), false);
 });
 
-test('predicate: no port holder, command line unreadable (null) — vetoed, not trusted by default', () => {
+test('predicate: no listener, command line unreadable (null) — vetoed, not trusted by default', () => {
   assert.equal(pidfileIdentityVerified(4242, [], null), false);
 });
 
@@ -67,38 +99,95 @@ test('looksLikeDaemonProcess: null (ps failed / pid already gone) does not match
   assert.equal(looksLikeDaemonProcess(null), false);
 });
 
-test('wiring: verified pidfile PID (matches the port) is group-signalled and cleared', async (t) => {
+test('wiring: a listener sharing the pidfile pid\'s group is group-signalled and cleared', async (t) => {
   const killGroup = t.mock.fn();
   const killPid = t.mock.fn();
   const clearPidFile = t.mock.fn();
   const getCommandLine = t.mock.fn(() => 'npm run test:daemon');
+  // pidfile pid is the group leader; the listener is a different pid in the
+  // same family and inherits its pgid — a raw pid match would miss this.
+  const getGroupId = (pid) => (pid === 4242 || pid === 5555 ? 4242 : null);
 
   await stopDaemon(true, {
     readPidFile: () => 4242,
     isRunning: () => true,
-    getPortHolders: () => [4242],
+    getPortHolders: () => [5555],
     getCommandLine,
+    getGroupId,
     killGroup,
     killPid,
     clearPidFile,
   });
 
   assert.equal(killGroup.mock.callCount(), 1);
-  assert.equal(killGroup.mock.calls[0].arguments[0], 4242);
+  assert.equal(killGroup.mock.calls[0].arguments[0], 4242, 'group-signals the PIDFILE pid, which IS the group leader');
   assert.equal(killPid.mock.callCount(), 0, 'must not also signal individually');
   assert.equal(clearPidFile.mock.callCount(), 1);
-  assert.equal(getCommandLine.mock.callCount(), 0, 'a matched port holder never needs a command-line check');
+  assert.equal(getCommandLine.mock.callCount(), 0, 'a matched listener never needs a command-line check');
 });
 
-test('wiring: a reused pidfile PID is never group-signalled; the real port holder is killed instead', async (t) => {
+test('wiring: the exact observed shape — pidfile 22175, listener 22237, same pgid — verifies and group-signals', async (t) => {
+  // The live shape this bug was diagnosed against: `npm run test:daemon`
+  // (pidfile pid, detached group leader) execs down to a grandchild that
+  // actually binds the port. Both share the leader's pgid.
   const killGroup = t.mock.fn();
   const killPid = t.mock.fn();
   const clearPidFile = t.mock.fn();
+  const getGroupId = (pid) => (pid === 22175 || pid === 22237 ? 22175 : null);
+
+  await stopDaemon(true, {
+    readPidFile: () => 22175,
+    isRunning: () => true,
+    getPortHolders: () => [22237],
+    getGroupId,
+    killGroup,
+    killPid,
+    clearPidFile,
+  });
+
+  assert.equal(killGroup.mock.callCount(), 1);
+  assert.equal(killGroup.mock.calls[0].arguments[0], 22175);
+  assert.equal(killPid.mock.callCount(), 0);
+  assert.equal(clearPidFile.mock.callCount(), 1);
+});
+
+test('wiring: same pid shape (22175/22237) but a DIFFERENT pgid must never be signalled', async (t) => {
+  // Negative of the above: the listener exists, but it belongs to some
+  // unrelated process tree — a kernel-recycled pidfile pid, or a coincidence
+  // of pid numbering. Must fall to the single-pid kill of the real listener,
+  // never a group signal on the pidfile pid.
+  const killGroup = t.mock.fn();
+  const killPid = t.mock.fn();
+  const clearPidFile = t.mock.fn();
+  const getGroupId = (pid) => (pid === 22175 ? 9999 : pid === 22237 ? 22237 : null);
+
+  await stopDaemon(true, {
+    readPidFile: () => 22175,
+    isRunning: () => true,
+    getPortHolders: () => [22237],
+    getGroupId,
+    killGroup,
+    killPid,
+    clearPidFile,
+  });
+
+  assert.equal(killGroup.mock.callCount(), 0, 'the pidfile pid must never be process-group-signalled');
+  assert.equal(killPid.mock.callCount(), 1);
+  assert.equal(killPid.mock.calls[0].arguments[0], 22237);
+  assert.equal(clearPidFile.mock.callCount(), 1);
+});
+
+test('wiring: a reused pidfile PID is never group-signalled; the real listener is killed instead', async (t) => {
+  const killGroup = t.mock.fn();
+  const killPid = t.mock.fn();
+  const clearPidFile = t.mock.fn();
+  const getGroupId = (pid) => (pid === 4242 ? 9999 : pid === 777 ? 777 : null);
 
   await stopDaemon(true, {
     readPidFile: () => 4242, // reused pid, unrelated to the daemon
     isRunning: () => true,
-    getPortHolders: () => [777], // the real daemon
+    getPortHolders: () => [777], // the real daemon's listener
+    getGroupId,
     killGroup,
     killPid,
     clearPidFile,

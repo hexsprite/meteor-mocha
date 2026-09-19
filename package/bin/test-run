@@ -1294,13 +1294,19 @@ async function startDaemon(quiet = false) {
 }
 
 /**
- * PIDs currently bound to this worktree's daemon port, via lsof. This is
- * the stop-by-port fallback, and — via pidfileIdentityVerified below — the
+ * PIDs LISTENING on this worktree's daemon port, via lsof. This is the
+ * stop-by-port fallback, and — via pidfileIdentityVerified below — the
  * signal that vetoes a stale pidfile PID before it gets group-signalled.
+ *
+ * Listener-only (-sTCP:LISTEN) on purpose: a bare `lsof -ti:<port>` also
+ * returns established CLIENT sockets on that port, and this harness's own
+ * process is one — harness.mjs's health()/fileMap() fetch the daemon
+ * in-process. A client socket must never be able to authorize a signal
+ * (fo-pi0kl: that gap self-SIGTERMed the test runner mid-suite).
  */
 function getPortHolderPids(targetPort = port) {
   try {
-    const result = execSync(`lsof -ti:${targetPort}`).toString().trim()
+    const result = execSync(`lsof -nP -iTCP:${targetPort} -sTCP:LISTEN -t`).toString().trim()
     return result ? result.split('\n').map((p) => parseInt(p, 10)) : []
   } catch {
     return []
@@ -1314,6 +1320,23 @@ function getPortHolderPids(targetPort = port) {
 function getProcessCommandLine(pid) {
   try {
     return execSync(`ps -o command= -p ${pid}`).toString().trim()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The process group id of a live pid, via ps. Null if ps fails (pid already
+ * gone) or the output isn't a number — read as "not evidence", same as every
+ * other null here, never as a match. See pidfileIdentityVerified: startDaemon
+ * spawns the pidfile pid with `detached: true`, making it a process group
+ * leader, so every real descendant — including the listener grandchild —
+ * shares its pgid.
+ */
+function getProcessGroupId(pid) {
+  try {
+    const pgid = parseInt(execSync(`ps -o pgid= -p ${pid}`).toString().trim(), 10)
+    return Number.isNaN(pgid) ? null : pgid
   } catch {
     return null
   }
@@ -1343,20 +1366,29 @@ function looksLikeDaemonProcess(commandLine) {
  * it automatically, so a reused PID can get process-group-signalled with no
  * one deciding to do it (fo-pi0kl).
  *
- * The process actually bound to this worktree's daemon port IS
- * self-identifying, so a port holder is authoritative: trust the pidfile
- * pid only when it IS one of them, veto it the instant a DIFFERENT pid
- * holds the port — group-signalling the pidfile pid then would hit
- * whatever the kernel later gave that number, not the daemon.
+ * The process actually LISTENING on this worktree's daemon port is
+ * self-identifying, but comparing raw pids is too strict: the pidfile holds
+ * the DETACHED WRAPPER's pid (npm, per startDaemon), while the port is bound
+ * by its grandchild (the meteor-tool process npm eventually execs into), so
+ * a genuinely healthy daemon's own pid never appears in the listener list at
+ * all — confirmed live (pidfile pid, listener pid three levels down, both
+ * under the pidfile pid's own pgid). Compare process GROUPS instead:
+ * `detached: true` makes the pidfile pid a group leader, so every real
+ * descendant inherits its pgid. Trust the pidfile pid only when some
+ * listener shares its group, veto it the instant a listener's group differs
+ * — group-signalling the pidfile pid then would hit whatever the kernel
+ * later gave that number, not the daemon.
  *
- * No port holder at all (a crashed daemon whose listener already dropped,
- * or simply nothing running) is a different case: absence of a port holder
- * is absence of evidence, not evidence of identity, so it must NOT fall
- * back to blind trust. Instead fall back to the one signal still
- * available — does the pid's own command line look like this daemon.
+ * No listener at all (a crashed daemon whose port already dropped, or
+ * simply nothing running) is a different case: absence of a listener is
+ * absence of evidence, not evidence of identity, so it must NOT fall back
+ * to blind trust. Instead fall back to the one signal still available —
+ * does the pid's own command line look like this daemon.
  */
-function pidfileIdentityVerified(pidfilePid, portHolderPids, commandLine) {
-  if (portHolderPids.length) return portHolderPids.includes(pidfilePid)
+function pidfileIdentityVerified(pidfileGroupId, listenerGroupIds, commandLine) {
+  if (listenerGroupIds.length) {
+    return pidfileGroupId != null && listenerGroupIds.includes(pidfileGroupId)
+  }
   return looksLikeDaemonProcess(commandLine)
 }
 
@@ -1368,6 +1400,7 @@ async function stopDaemon(quiet = false, {
   isRunning = isProcessRunning,
   getPortHolders = getPortHolderPids,
   getCommandLine = getProcessCommandLine,
+  getGroupId = getProcessGroupId,
   killGroup = terminateProcess,
   killPid = (p) => process.kill(p, 'SIGTERM'),
   clearPidFile = removePid,
@@ -1379,8 +1412,12 @@ async function stopDaemon(quiet = false, {
   // check against instead — the common (matched or mismatched) case never
   // needs it.
   const commandLine = alive && !portPids.length ? getCommandLine(pid) : null
+  // Group ids only matter when there's a listener to compare the pidfile
+  // pid's group against — see pidfileIdentityVerified.
+  const pidfileGroupId = alive && portPids.length ? getGroupId(pid) : null
+  const listenerGroupIds = portPids.length ? portPids.map(getGroupId) : []
 
-  if (alive && pidfileIdentityVerified(pid, portPids, commandLine)) {
+  if (alive && pidfileIdentityVerified(pidfileGroupId, listenerGroupIds, commandLine)) {
     if (!quiet) {
       console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
     }
