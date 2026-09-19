@@ -1984,6 +1984,45 @@ function shouldRestartDeadWatcher(freshness, alreadyAttempted) {
   return true
 }
 
+/**
+ * Decide-and-act step for the dead-watcher restart, extracted out of
+ * runTests() so the wiring is testable without a running daemon: `stop`,
+ * `start` and `recheck` are the side effects, injectable with fakes and
+ * defaulting to the real stopDaemon/startDaemon/ensureDaemonFresh.
+ *
+ * Called at most once per runTests() invocation (never from a loop), so
+ * passing `false` for shouldRestartDeadWatcher's alreadyAttempted is always
+ * correct here — that guard exists for the predicate's own contract, not
+ * because this function retries.
+ *
+ * Returns the freshness to carry forward: the rechecked verdict after a
+ * restart (whether or not it cleared), or the original verdict untouched
+ * when no restart was warranted or the daemon failed to start.
+ */
+async function restartDeadWatcherIfNeeded(freshness, {
+  stop = stopDaemon,
+  start = startDaemon,
+  recheck = ensureDaemonFresh,
+  wait = () => new Promise((r) => setTimeout(r, 1000)),
+} = {}) {
+  if (!shouldRestartDeadWatcher(freshness, false)) return freshness
+
+  // A dead watcher never enters "building" during ensureDaemonFresh's wait,
+  // so nothing will fix this on its own. Restart once and recheck. Always on
+  // stderr, in both modes — see fo-23gyk, which needs this traceable rather
+  // than silently self-healed.
+  const restartMessage = `⚠ Test daemon watcher appears DEAD (source changed but no rebuild ever started) — restarting the daemon once.`
+  console.error(jsonMode ? restartMessage : `\n${colors.yellow}${restartMessage}${colors.reset}`)
+  watcherRestarted = true
+
+  await stop(jsonMode)
+  await wait()
+  const startResult = await start(jsonMode)
+  if (startResult !== true) return freshness
+
+  return await recheck()
+}
+
 async function runTests() {
   // Refuse to serve results from a wedged daemon (stale bundle). See
   // ensureDaemonFresh — a rebuild in flight waits, a wedged one reports.
@@ -1999,27 +2038,7 @@ async function runTests() {
     }
   }
 
-  // Local to this invocation: shouldRestartDeadWatcher will never say yes
-  // twice within one runTests() call, so a dead watcher that survives the
-  // restart falls straight into the stale-report branch below instead of
-  // restarting again.
-  let watcherRestartAttempted = false
-  if (shouldRestartDeadWatcher(freshness, watcherRestartAttempted)) {
-    // A dead watcher never enters "building" during ensureDaemonFresh's wait,
-    // so nothing will fix this on its own. Restart once and recheck. Always
-    // on stderr, in both modes — see fo-23gyk, which needs this traceable
-    // rather than silently self-healed.
-    const restartMessage = `⚠ Test daemon watcher appears DEAD (source changed but no rebuild ever started) — restarting the daemon once.`
-    console.error(jsonMode ? restartMessage : `\n${colors.yellow}${restartMessage}${colors.reset}`)
-    watcherRestarted = true
-    await stopDaemon(jsonMode)
-    await new Promise((r) => setTimeout(r, 1000))
-    const startResult = await startDaemon(jsonMode)
-    watcherRestartAttempted = true
-    if (startResult === true) {
-      freshness = await ensureDaemonFresh()
-    }
-  }
+  freshness = await restartDeadWatcherIfNeeded(freshness)
 
   if (freshness.stale) {
     const staleError = `${describeStaleness(freshness, filePattern)} ${DAEMON_FIX_HINT}`
@@ -2742,6 +2761,7 @@ module.exports = {
   evaluateStamps,
   describeStaleness,
   shouldRestartDeadWatcher,
+  restartDeadWatcherIfNeeded,
   classifyDaemonFullness,
   isWedgedEmptyResult,
   cacheBuildBasis,
