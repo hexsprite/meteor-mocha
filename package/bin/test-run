@@ -1293,49 +1293,137 @@ async function startDaemon(quiet = false) {
   }
 }
 
-// Stop daemon
-async function stopDaemon(quiet = false) {
-  const pid = readPid()
-  if (pid && isProcessRunning(pid)) {
+/**
+ * PIDs currently bound to this worktree's daemon port, via lsof. This is
+ * the stop-by-port fallback, and — via pidfileIdentityVerified below — the
+ * signal that vetoes a stale pidfile PID before it gets group-signalled.
+ */
+function getPortHolderPids(targetPort = port) {
+  try {
+    const result = execSync(`lsof -ti:${targetPort}`).toString().trim()
+    return result ? result.split('\n').map((p) => parseInt(p, 10)) : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The command line of a live pid, via ps. Used only when no port holder
+ * exists to compare the pidfile pid against — see pidfileIdentityVerified.
+ */
+function getProcessCommandLine(pid) {
+  try {
+    return execSync(`ps -o command= -p ${pid}`).toString().trim()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Pure core: does this command line look like OUR daemon — `npm run
+ * test:daemon`, per startDaemon's spawn call — rather than whatever the
+ * kernel handed this pid after the real daemon exited? Deliberately narrow:
+ * a bare 'node', an empty string, or null (ps failed / pid already gone)
+ * all read as false. An unmatched command line is not evidence of
+ * anything; it is simply not evidence FOR trusting this pid.
+ */
+function looksLikeDaemonProcess(commandLine) {
+  return typeof commandLine === 'string' && commandLine.includes('test:daemon')
+}
+
+/**
+ * Pure core: should stopDaemon trust the pidfile PID enough to
+ * process-group-signal it?
+ *
+ * The pidfile is not self-identifying — nothing in the repo keeps it in
+ * sync with a crashed daemon (see stop-stale-daemon.sh), and the kernel
+ * reuses PIDs — so "the pidfile says N and N is alive" only ever proved
+ * liveness, never identity. That was tolerable while stopDaemon only ran
+ * from a human typing `daemon stop`. restartDeadWatcherIfNeeded now calls
+ * it automatically, so a reused PID can get process-group-signalled with no
+ * one deciding to do it (fo-pi0kl).
+ *
+ * The process actually bound to this worktree's daemon port IS
+ * self-identifying, so a port holder is authoritative: trust the pidfile
+ * pid only when it IS one of them, veto it the instant a DIFFERENT pid
+ * holds the port — group-signalling the pidfile pid then would hit
+ * whatever the kernel later gave that number, not the daemon.
+ *
+ * No port holder at all (a crashed daemon whose listener already dropped,
+ * or simply nothing running) is a different case: absence of a port holder
+ * is absence of evidence, not evidence of identity, so it must NOT fall
+ * back to blind trust. Instead fall back to the one signal still
+ * available — does the pid's own command line look like this daemon.
+ */
+function pidfileIdentityVerified(pidfilePid, portHolderPids, commandLine) {
+  if (portHolderPids.length) return portHolderPids.includes(pidfilePid)
+  return looksLikeDaemonProcess(commandLine)
+}
+
+// Stop daemon. Dependencies are injectable so the identity-check wiring
+// (not just pidfileIdentityVerified in isolation) can be unit-tested — see
+// tests/unit/stopDaemonIdentity.test.mjs.
+async function stopDaemon(quiet = false, {
+  readPidFile = readPid,
+  isRunning = isProcessRunning,
+  getPortHolders = getPortHolderPids,
+  getCommandLine = getProcessCommandLine,
+  killGroup = terminateProcess,
+  killPid = (p) => process.kill(p, 'SIGTERM'),
+  clearPidFile = removePid,
+} = {}) {
+  const pid = readPidFile()
+  const alive = Boolean(pid) && isRunning(pid)
+  const portPids = getPortHolders(port)
+  // Only shell out for a command line when there is no port holder to
+  // check against instead — the common (matched or mismatched) case never
+  // needs it.
+  const commandLine = alive && !portPids.length ? getCommandLine(pid) : null
+
+  if (alive && pidfileIdentityVerified(pid, portPids, commandLine)) {
     if (!quiet) {
       console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
     }
     // Kill the process group to get all child processes
-    terminateProcess(pid)
-    removePid()
+    killGroup(pid)
+    clearPidFile()
     if (!quiet) {
       console.log(`${colors.green}Daemon stopped${colors.reset}`)
     }
-  } else {
-    // Try to find and kill by port
-    try {
-      const result = execSync(`lsof -ti:${port}`).toString().trim()
-      if (result) {
-        const pids = result.split('\n')
-        for (const p of pids) {
-          try {
-            process.kill(parseInt(p, 10), 'SIGTERM')
-            if (!quiet) {
-              console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
-            }
-          } catch {
-            // Process already dead
-          }
-        }
-        removePid()
+    return
+  }
+
+  if (alive) {
+    // pid is alive but could not be verified as the daemon — either a
+    // different pid holds this worktree's port, or (with no port holder to
+    // check) its command line doesn't look like the daemon either. Either
+    // way the kernel most likely reused this pid for something else; never
+    // group-signal it. Clear the pidfile now so it can't be trusted again
+    // by mistake — unless a real port holder is about to be found and
+    // killed below, which clears it anyway.
+    if (!portPids.length) clearPidFile()
+    if (!quiet) {
+      console.log(`${colors.yellow}Ignoring PID file (${pid}) — could not verify it as the daemon${colors.reset}`)
+    }
+  }
+
+  if (portPids.length) {
+    for (const p of portPids) {
+      try {
+        killPid(p)
         if (!quiet) {
-          console.log(`${colors.green}Daemon stopped${colors.reset}`)
+          console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
         }
-      } else {
-        if (!quiet) {
-          console.log(`${colors.dim}No daemon running${colors.reset}`)
-        }
-      }
-    } catch {
-      if (!quiet) {
-        console.log(`${colors.dim}No daemon running${colors.reset}`)
+      } catch {
+        // Process already dead
       }
     }
+    clearPidFile()
+    if (!quiet) {
+      console.log(`${colors.green}Daemon stopped${colors.reset}`)
+    }
+  } else if (!quiet) {
+    console.log(`${colors.dim}No daemon running${colors.reset}`)
   }
 }
 
@@ -2762,6 +2850,9 @@ module.exports = {
   describeStaleness,
   shouldRestartDeadWatcher,
   restartDeadWatcherIfNeeded,
+  pidfileIdentityVerified,
+  looksLikeDaemonProcess,
+  stopDaemon,
   classifyDaemonFullness,
   isWedgedEmptyResult,
   cacheBuildBasis,
