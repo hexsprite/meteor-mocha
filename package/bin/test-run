@@ -1030,8 +1030,8 @@ function captureDiagnosticSnapshot(label, daemonPid) {
 // not read the same as a probe that completed and found nothing — the first
 // is "we don't know," the second is "confirmed unused," and only the second
 // may authorize deletion. execFileSync distinguishes the two in the error it
-// throws: a spawn failure (missing lsof binary) sets `err.code === 'ENOENT'`
-// with no `.status`; a timeout kill sets `err.signal`; a normal nonzero exit
+// throws: a spawn failure (missing lsof binary, EACCES, ...) sets `err.code`
+// with no numeric `.status`; a timeout kill sets `err.signal`; a normal nonzero exit
 // (lsof ran, found nothing) sets `err.status` to a number and leaves
 // `err.code`/`err.signal` unset. Only the last of these means "confirmed
 // unused" — the first two fail CLOSED (report in-use, skip deletion).
@@ -1051,7 +1051,9 @@ function isDirInUse(dirPath, { execFileSyncImpl = execFileSync } = {}) {
     return out.trim().length > 0
   } catch (err) {
     if (err.stdout && err.stdout.trim().length > 0) return true
-    if (err.code === 'ENOENT' || err.signal) return true // couldn't complete — fail closed
+    // Only an exit status proves lsof ran to completion; a spawn error
+    // (ENOENT, EACCES, ...) or a timeout kill fails closed.
+    if (typeof err.status !== 'number' || err.signal) return true
     return false // ran, exited nonzero, no output — confirmed nothing has it open
   }
 }

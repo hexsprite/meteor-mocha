@@ -75,6 +75,7 @@ test('isDirInUse reads false from a nonzero exit with no rows (nothing has it op
   const inUse = isDirInUse('/tmp/whatever', {
     execFileSyncImpl: () => {
       const err = new Error('Command failed');
+      err.status = 1;
       err.stdout = '';
       throw err;
     },
@@ -102,6 +103,19 @@ test('isDirInUse fails closed (reports in-use) when the lsof call times out', ()
     execFileSyncImpl: () => {
       const err = new Error('Command timed out');
       err.signal = 'SIGTERM';
+      throw err;
+    },
+  });
+  assert.equal(inUse, true);
+});
+
+// Any spawn failure, not just a missing binary, means lsof never ran.
+test('isDirInUse fails closed when lsof cannot be spawned for a reason other than ENOENT', () => {
+  const inUse = isDirInUse('/tmp/whatever', {
+    execFileSyncImpl: () => {
+      const err = new Error('spawnSync lsof EACCES');
+      err.code = 'EACCES';
+      err.status = null;
       throw err;
     },
   });
