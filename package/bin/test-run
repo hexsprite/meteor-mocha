@@ -30,11 +30,46 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
+// fo-zj5oj: this file is require()'d in-process by scripts/test-run's shim
+// rather than exec'd as its own process, so process.cwd() here is whatever
+// directory the invoking shell sat in — not necessarily this worktree's
+// root. AGENTS.md forbids a leading `cd` on shell commands, so invoking
+// `scripts/test-run` by absolute path from elsewhere is the documented
+// style, and every process.cwd()-rooted path below used to resolve against
+// the wrong checkout. Worse: TEST_PORT is already derived correctly per
+// worktree (scripts/test-run resolves it from its own __dirname), so a
+// wrong-tree daemon still answered on the right port and the run reported a
+// clean, meaningless green. Resolve from this file's own location instead —
+// the same move scripts/test-run already makes for TEST_PORT — by walking
+// up to the nearest ancestor with a `.meteor` directory. Fail loudly if none
+// exists rather than silently falling back to process.cwd(), which is
+// exactly the bug this exists to catch.
+function resolveProjectRoot(startDir = __dirname) {
+  let dir = startDir
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.meteor'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      throw new Error(
+        `test-run: could not resolve the project root by walking up from ${startDir} ` +
+          '(no ancestor directory has a .meteor/). Refusing to fall back to ' +
+          'process.cwd() -- that is exactly the bug this check exists to catch.',
+      )
+    }
+    dir = parent
+  }
+}
+
+// TEST_RUN_PROJECT_ROOT is a test-only escape hatch, mirroring TEST_PORT
+// below: this file's own unit tests need an isolated tmpdir rather than the
+// real worktree, and resolveProjectRoot() deliberately has no cwd-based path
+// left to hijack for that anymore.
+const PROJECT_ROOT = process.env.TEST_RUN_PROJECT_ROOT || resolveProjectRoot()
 const port = process.env.TEST_PORT || 9100
-const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
-const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
-const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
-const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
+const pidFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.pid')
+const logFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.log')
+const lockFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.lock')
+const cacheFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-cache.json')
 const CACHE_TTL_MS = 60000 // 1 minute
 // fo-fxz1c: a killed daemon orphans its meteor-test-run* build dir under the
 // OS tmpdir (~300MB each) and nothing else ever reaps them — 24 dirs / 5GB
@@ -45,7 +80,7 @@ const STALE_TEMP_DIR_MAX_AGE_MS = Number(process.env.TEST_RUN_STALE_TEMP_DIR_MAX
 const HEALTH_CHECK_TIMEOUT_MS = 2000
 const RESTART_WAIT_TIMEOUT_MS = 120000
 const DEFAULT_HOT_RELOAD_FILE = path.join(
-  process.cwd(),
+  PROJECT_ROOT,
   'imports',
   'startup',
   'tests',
@@ -999,7 +1034,7 @@ function captureDiagnosticSnapshot(label, daemonPid) {
       .toString().trim().split('\n').filter(Boolean).slice(0, 20)
   } catch { snapshot.meteor_procs = [] }
   try {
-    const stat = fs.statSync(path.join(process.cwd(), '.meteor', 'local'))
+    const stat = fs.statSync(path.join(PROJECT_ROOT, '.meteor', 'local'))
     snapshot.dotmeteor_local_mtime = stat.mtime.toISOString()
   } catch { snapshot.dotmeteor_local_mtime = null }
   // Was the daemon log written to recently? Helps distinguish "build still
@@ -1183,7 +1218,7 @@ async function startDaemon(quiet = false) {
       const child = spawn('npm', ['run', 'test:daemon'], {
         detached: true,
         stdio: ['ignore', out, err],
-        cwd: process.cwd(),
+        cwd: PROJECT_ROOT,
       })
 
       writePid(child.pid)
@@ -1928,7 +1963,7 @@ function readJsonFile(file) {
  * An app without that plugin has no stamps, which the caller reports as
  * unknown freshness — never as fresh.
  */
-function readBuildStamps(cwd = process.cwd(), contextDir = BUILD_CONTEXT_DIR) {
+function readBuildStamps(cwd = PROJECT_ROOT, contextDir = BUILD_CONTEXT_DIR) {
   const root = path.join(cwd, contextDir)
   const stamps = []
   let modes
@@ -2002,7 +2037,7 @@ function hashDirTree(dir) {
  * would wait for a rebuild that never comes and cry wedged on a healthy
  * daemon — observed on a live daemon while building this.
  */
-function scanStampInputs(stamp, cwd = process.cwd()) {
+function scanStampInputs(stamp, cwd = PROJECT_ROOT) {
   let newest = 0
   let missing = null
   for (const rel of stamp.inputs) {
@@ -2055,7 +2090,7 @@ function classifyStampFreshness({
  * stale; `building` and `failed` describe what the compiler is doing about it,
  * which is what decides whether waiting is worth anything.
  */
-function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
+function evaluateStamps(entries, targetMtime = 0, cwd = PROJECT_ROOT) {
   let worst = null
   let building = false
   let failed = null
@@ -2123,7 +2158,7 @@ async function ensureDaemonFresh() {
   let targetMtime = 0
   if (filePattern) {
     try {
-      targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
+      targetMtime = fs.statSync(path.join(PROJECT_ROOT, filePattern)).mtimeMs
     } catch {
       // Exact path that's gone → the daemon may still hold the removed spec and
       // we can't verify otherwise: hard stale, no point waiting for a rebuild
@@ -3011,6 +3046,7 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  resolveProjectRoot,
   acquireLock,
   createJsonProgressLogger,
   createRestartLoopTracker,
