@@ -168,6 +168,58 @@ The `done` event carries two diagnostic counts:
 - `testsMatched` — tests scheduled to run after grep filtering (Mocha's
   `runner.total`).
 
+### Staleness guard
+
+Before dispatching **any** run, the client asks the build what it compiled, and
+refuses to report results when disk is ahead of it.
+
+The build answers through **build stamps**, written by `BuildStampPlugin` in the
+app's `rspack.config.js` on every watch rebuild, next to the bundle:
+
+- `<build-context>/<mode>/.build-stamp-server.json` — the last successful
+  compile: `builtAt`, `newestInputMtime`, `inputCount`, and the `inputs`
+  themselves (`compilation.fileDependencies`, project files only).
+- `<build-context>/<mode>/.build-state-server.json` — what the compiler is doing
+  now: `building`, `ok` or `failed`.
+
+The client stats the recorded inputs. An input now newer than
+`newestInputMtime`, or one that has been deleted, means the daemon is serving a
+stale suite. So does a named target the build has never read — a brand-new spec
+is in no input list until the rebuild that adds it. The client-side stamp is
+ignored on purpose: the daemon runs server tests only, and Tailwind's content
+glob drags `docs/`, `.beads/` and `.claude/` into the client dependency graph.
+
+The wait is bounded by evidence rather than by a fixed budget. While the state
+file says `building`, the client waits for that compile (backstopped by
+`TEST_DAEMON_REBUILD_WAIT_MS`, which only a hung compile reaches). When it says
+otherwise and the bundle is still behind, the watcher never noticed the edit —
+reported after `TEST_DAEMON_WATCH_NOTICE_MS`, so a wedge surfaces in seconds
+instead of minutes.
+
+Watched directories compare by **listing**, not mtime. Creating and removing a
+scratch file inside one moves its mtime while leaving the listing identical;
+rspack compares contents and does not rebuild, so an mtime check would wait for
+a rebuild that never comes and cry wedged on a healthy daemon. Dotfiles are
+excluded from the listing so a stray `.DS_Store` cannot do the same.
+
+**The guard only applies while a daemon is up.** The stamp is a file, so it
+outlives the process — a stopped daemon plus an edited tree would otherwise read
+as stale forever, and the run would exit 2 before starting the daemon that
+clears it. That would brick `test-run daemon stop && test-run`, the recovery
+path the error message itself recommends.
+
+**No stamp is not "fresh".** An app whose `rspack.config.js` has no
+`BuildStampPlugin` gets `freshness: "unknown"` on every machine-readable payload
+and a warning on the console.
+
+This applies to grep runs, file-targeted runs and bare full runs alike. It used
+to run only for file-targeted (`-f`/path) invocations, which left the everyday
+`test-run <pattern>` and `test-run -t <pattern>` forms reporting confident green
+against a wedged daemon (fo-u728l). Until fo-zdpf0 it also reconstructed the
+input set from a hand-written list of source roots and extensions; any drift
+from rspack's real watch set gave a wrong answer in both directions — false
+wedges that blocked pushes, and the silent opposite.
+
 ### Wedged-empty-bundle detection
 
 The daemon can enter a state where a rebuild fired (so `builtAt` is fresh and the

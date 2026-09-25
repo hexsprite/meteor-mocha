@@ -24,20 +24,63 @@ process.removeAllListeners('warning')
  */
 
 const http = require('http')
-const { spawn, execSync } = require('child_process')
+const { spawn, execSync, execFileSync } = require('child_process')
+const crypto = require('crypto')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 
+// fo-zj5oj: this file is require()'d in-process by scripts/test-run's shim
+// rather than exec'd as its own process, so process.cwd() here is whatever
+// directory the invoking shell sat in — not necessarily this worktree's
+// root. AGENTS.md forbids a leading `cd` on shell commands, so invoking
+// `scripts/test-run` by absolute path from elsewhere is the documented
+// style, and every process.cwd()-rooted path below used to resolve against
+// the wrong checkout. Worse: TEST_PORT is already derived correctly per
+// worktree (scripts/test-run resolves it from its own __dirname), so a
+// wrong-tree daemon still answered on the right port and the run reported a
+// clean, meaningless green. Resolve from this file's own location instead —
+// the same move scripts/test-run already makes for TEST_PORT — by walking
+// up to the nearest ancestor with a `.meteor` directory. Fail loudly if none
+// exists rather than silently falling back to process.cwd(), which is
+// exactly the bug this exists to catch.
+function resolveProjectRoot(startDir = __dirname) {
+  let dir = startDir
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.meteor'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      throw new Error(
+        `test-run: could not resolve the project root by walking up from ${startDir} ` +
+          '(no ancestor directory has a .meteor/). Refusing to fall back to ' +
+          'process.cwd() -- that is exactly the bug this check exists to catch.',
+      )
+    }
+    dir = parent
+  }
+}
+
+// TEST_RUN_PROJECT_ROOT is a test-only escape hatch, mirroring TEST_PORT
+// below: this file's own unit tests need an isolated tmpdir rather than the
+// real worktree, and resolveProjectRoot() deliberately has no cwd-based path
+// left to hijack for that anymore.
+const PROJECT_ROOT = process.env.TEST_RUN_PROJECT_ROOT || resolveProjectRoot()
 const port = process.env.TEST_PORT || 9100
-const pidFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.pid')
-const logFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.log')
-const lockFile = path.join(process.cwd(), '.meteor', 'local', 'test-daemon.lock')
-const cacheFile = path.join(process.cwd(), '.meteor', 'local', 'test-cache.json')
+const pidFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.pid')
+const logFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.log')
+const lockFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-daemon.lock')
+const cacheFile = path.join(PROJECT_ROOT, '.meteor', 'local', 'test-cache.json')
 const CACHE_TTL_MS = 60000 // 1 minute
+// fo-fxz1c: a killed daemon orphans its meteor-test-run* build dir under the
+// OS tmpdir (~300MB each) and nothing else ever reaps them — 24 dirs / 5GB
+// measured in one session. Age-gated (not "every dir not ours") so a
+// concurrently-running daemon's own live dir, started moments ago, is never
+// touched by another daemon's startup reap.
+const STALE_TEMP_DIR_MAX_AGE_MS = Number(process.env.TEST_RUN_STALE_TEMP_DIR_MAX_AGE_MS) || 4 * 60 * 60 * 1000
 const HEALTH_CHECK_TIMEOUT_MS = 2000
 const RESTART_WAIT_TIMEOUT_MS = 120000
 const DEFAULT_HOT_RELOAD_FILE = path.join(
-  process.cwd(),
+  PROJECT_ROOT,
   'imports',
   'startup',
   'tests',
@@ -67,7 +110,15 @@ const errorLineSnippets = [
   'heap out of memory',
 ]
 
+// Lines that contain an error-shaped snippet above but are not fatal to the
+// daemon. macOS logs 'Failed to start watcher for <path>: [Error: Error
+// starting FSEvents stream]' when a watcher can't attach under load — the
+// daemon keeps running and rebuilds normally, but the bare 'Error' snippet
+// above would otherwise score it as the crash (fo-a3v67).
+const benignLineSnippets = ['Failed to start watcher for']
+
 function isDaemonErrorLine(line) {
+  if (benignLineSnippets.some(snippet => line.includes(snippet))) return false
   return errorLineSnippets.some(snippet => line.includes(snippet))
 }
 
@@ -353,8 +404,10 @@ function acquireLock() {
     if (age < LOCK_STALE_MS && isProcessRunning(pid)) {
       return false // Lock is held by another process
     }
-    // Stale lock - we can take over
-    console.log(`${colors.dim}Cleaning up stale lock file${colors.reset}`)
+    // Stale lock - we can take over. stderr, not stdout: the pre-push hook
+    // pipes `test-run --json` stdout straight into jq, and this ran
+    // unconditionally on stdout regardless of --json (fo-754ok).
+    console.error(`${colors.dim}Cleaning up stale lock file${colors.reset}`)
   } catch {
     // No lock file or invalid - we can acquire
   }
@@ -439,85 +492,6 @@ function tailLogFile() {
   return { start: startTailing, stop: stopTailing }
 }
 
-// Source roots Meteor/Rspack actually bundles. Beyond the obvious imports//
-// server//client/, the app still loads the legacy /lib + /common roots via
-// explicit imports (imports/utils/dateparse.app-spec.ts imports /lib/dateparse),
-// its local Meteor packages under /packages, and the mobile/web/support apps
-// under /apps (imports/startup/client imports /apps/mobile + /apps/web; specs
-// import /apps/support-agent). An edit under any of these can change what a
-// spec exercises, so all must feed the staleness basis — else an unchanged spec
-// importing the edited module shows old mtimes and a wedged daemon serves it
-// stale.
-const PROJECT_SOURCE_ROOTS = [
-  'imports',
-  'server',
-  'client',
-  'lib',
-  'common',
-  'packages',
-  'apps',
-]
-const PROJECT_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx'])
-// Never descend into dependency trees or build output — they aren't sources and
-// dwarf everything else. (Skipping node_modules also keeps /packages cheap.)
-const PROJECT_SCAN_SKIP_DIRS = new Set([
-  'node_modules',
-  '.git',
-  '.meteor',
-  'dist',
-  'build',
-  '.build',
-  'coverage',
-])
-
-/**
- * Latest mtime across all project source files under the bundled roots.
- *
- * A plain recursive readdir walk with an explicit skip list, chosen over
- * fs.promises.glob because it needs to scan /packages — local Meteor packages
- * that can carry their own installed node_modules (the meteor-mocha submodule
- * itself does once its dev deps are present). A `packages/**` glob would descend
- * into those dependency trees, so a routine `meteor npm install` would bump the
- * freshness basis and spuriously trip the staleness guard. The walk skips
- * node_modules/build output outright, and skipping symlinked dirs (isDirectory()
- * is false for a symlink Dirent) means no cycle risk. (Runtime is Meteor 3.5's
- * Node 24 everywhere this runs — Node compatibility is not the motivation.)
- *
- * Params are injectable for unit testing; production calls use the defaults.
- */
-async function getProjectMtime(cwd = process.cwd(), roots = PROJECT_SOURCE_ROOTS) {
-  let latestMtime = 0
-
-  const walk = (dir) => {
-    let entries
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return // root absent (e.g. no /common) or unreadable — skip
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) {
-        if (PROJECT_SCAN_SKIP_DIRS.has(entry.name)) continue
-        walk(full)
-      } else if (entry.isFile() && PROJECT_SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
-        try {
-          const { mtimeMs } = fs.statSync(full)
-          if (mtimeMs > latestMtime) latestMtime = mtimeMs
-        } catch {
-          // File vanished mid-walk — ignore
-        }
-      }
-    }
-  }
-
-  for (const root of roots) {
-    walk(path.join(cwd, root))
-  }
-
-  return latestMtime
-}
-
 /**
  * Read cache file
  */
@@ -541,34 +515,77 @@ function writeCache(data) {
 }
 
 /**
+ * Identity of the bundle(s) a result came from: each server-side build
+ * stamp's builtAt, in stamp order. The result cache is valid for exactly the
+ * bundle that produced it, so a rebuild — the same signal ensureDaemonFresh
+ * trusts — is what invalidates it (fo-jw0z4; mtime scanning left with
+ * fo-zdpf0). No stamps means no provable identity: never cache, never hit.
+ */
+function cacheBuildBasis() {
+  const stamps = readBuildStamps()
+  if (stamps.length === 0) return null
+  // Sorted for the same reason hashDirTree sorts: readBuildStamps walks the
+  // mode directories with readdirSync, and an order change between save and
+  // check would read as a different build and miss the cache.
+  return stamps
+    .map((s) => `${s.bundle}:${s.stamp.builtAt}`)
+    .sort()
+    .join('|')
+}
+
+/**
  * Check if we can use cached result
  */
-async function checkCache() {
+function checkCache() {
   const cache = readCache()
   if (!cache?.lastRun) return null
 
-  const { timestamp, projectMtime, output, exitCode, failures, jsonResult } = cache.lastRun
+  const { timestamp, buildBasis, output, exitCode, failures, jsonResult } = cache.lastRun
 
   // TTL check
   const age = Date.now() - timestamp
   if (age > CACHE_TTL_MS) return null
 
-  // File change check
-  const currentMtime = await getProjectMtime()
-  if (currentMtime > projectMtime) return null
+  // Rebuild check
+  const currentBasis = cacheBuildBasis()
+  if (!currentBasis || currentBasis !== buildBasis) return null
 
   return { output, exitCode, failures, age, jsonResult }
 }
 
 /**
- * Save result to cache
+ * Save result to cache. A failing run is never cached (fo-bhgu): a flaky
+ * timeout or transient failure would otherwise be replayed as a cache hit for
+ * up to CACHE_TTL_MS even after the underlying issue clears, and there is no
+ * legitimate reason to skip re-running tests that just failed.
+ *
+ * A failure also clears any existing entry for an older, same-basis success.
+ * Merely declining to overwrite it would leave that older success servable —
+ * a forced fresh run (e.g. --no-cache) surfacing a failure, followed by an
+ * ordinary run, would otherwise replay the stale success as a false green.
  */
-async function saveCache(output, exitCode, failures, jsonResult = null) {
-  const projectMtime = await getProjectMtime()
+function saveCache(output, exitCode, failures, jsonResult = null) {
+  if (exitCode !== 0) {
+    try {
+      fs.unlinkSync(cacheFile)
+    } catch {
+      // no cache file to remove -- already as invalidated as it gets
+    }
+    return
+  }
+  // Best-effort: a failed cache write must not kill the client mid-stream.
+  try {
+    writeCacheEntry(output, exitCode, failures, jsonResult)
+  } catch {
+    // ignore cache errors
+  }
+}
+
+function writeCacheEntry(output, exitCode, failures, jsonResult) {
   writeCache({
     lastRun: {
       timestamp: Date.now(),
-      projectMtime,
+      buildBasis: cacheBuildBasis(),
       output,
       exitCode,
       failures,
@@ -812,12 +829,36 @@ function buildLlmSummary(output, failureSummary) {
   return lines.join('\n')
 }
 
+/**
+ * Stable top-level pass/fail counts, always integers. `.stats.passes`/
+ * `.stats.failures` are authoritative when the mocha JSON reporter populated
+ * them; when it didn't (an error path, or a malformed/partial payload), fall
+ * back to the parsed failures array (and a clamped tests - failed - pending
+ * derivation for passed) so the fields are never null.
+ */
+function derivePassFailCounts(output, failureSummary) {
+  const stats = output?.stats
+  const failed = typeof stats?.failures === 'number' ? stats.failures : failureSummary.total
+  const passed = typeof stats?.passes === 'number'
+    ? stats.passes
+    : Math.max(
+      0,
+      (typeof stats?.tests === 'number' ? stats.tests : 0) -
+        failed -
+        (typeof stats?.pending === 'number' ? stats.pending : 0),
+    )
+  return { passed, failed }
+}
+
 function finalizeJsonOutput(output, options = {}) {
   const failureSummary = summarizeFailures(output.failures, options)
   const summary = buildLlmSummary(output, failureSummary)
+  const { passed, failed } = derivePassFailCounts(output, failureSummary)
 
   return {
     ...output,
+    passed,
+    failed,
     llm_summary: summary,
     llm_failures: failureSummary.items,
     llm_failures_total: failureSummary.total,
@@ -834,9 +875,22 @@ function formatMachineOutput(output, options = {}) {
   return JSON.stringify(formatted, null, 2)
 }
 
+// Set when no build stamp could be found, so freshness is neither proven nor
+// disproven. Surfaced on every machine-readable payload — a caller must never
+// read silence as "fresh".
+let freshnessUnknown = false
+
+// Set once this invocation restarts a dead-watcher daemon (see
+// shouldRestartDeadWatcher). Surfaced on every machine-readable payload after
+// that point — whatever this run ultimately reports, a caller parsing JSON
+// must be able to tell a restart happened, per fo-23gyk.
+let watcherRestarted = false
+
 function printMachineOutput(output, options = {}) {
   const mode = llmMode ? 'llm' : 'json'
-  console.log(formatMachineOutput(output, { ...options, mode }))
+  let payload = freshnessUnknown ? { ...output, freshness: 'unknown' } : output
+  if (watcherRestarted) payload = { ...payload, watcherRestarted: true }
+  console.log(formatMachineOutput(payload, { ...options, mode }))
 }
 
 function isActivityEvent(data) {
@@ -980,7 +1034,7 @@ function captureDiagnosticSnapshot(label, daemonPid) {
       .toString().trim().split('\n').filter(Boolean).slice(0, 20)
   } catch { snapshot.meteor_procs = [] }
   try {
-    const stat = fs.statSync(path.join(process.cwd(), '.meteor', 'local'))
+    const stat = fs.statSync(path.join(PROJECT_ROOT, '.meteor', 'local'))
     snapshot.dotmeteor_local_mtime = stat.mtime.toISOString()
   } catch { snapshot.dotmeteor_local_mtime = null }
   // Was the daemon log written to recently? Helps distinguish "build still
@@ -997,6 +1051,89 @@ function captureDiagnosticSnapshot(label, daemonPid) {
     snapshot.log_advancing = null
   }
   return snapshot
+}
+
+// fo-fxz1c review (pullfrog): age alone does not prove a dir is orphaned.
+// Separate worktrees run independent daemons sharing this OS tmpdir, and a
+// daemon that has simply been idle (no test runs) for longer than maxAgeMs
+// still owns its dir — deleting it out from under a live process would break
+// that worktree's next test run. `rmSync` does NOT fail just because a
+// process has the dir's files open (POSIX unlink succeeds regardless), so
+// the try/catch this used to rely on for "leave it if it's in use" never
+// actually protected anything. Check real liveness via lsof instead.
+// fo-fxz1c review (pullfrog, round 2): a probe that could not COMPLETE must
+// not read the same as a probe that completed and found nothing — the first
+// is "we don't know," the second is "confirmed unused," and only the second
+// may authorize deletion. execFileSync distinguishes the two in the error it
+// throws: a spawn failure (missing lsof binary, EACCES, ...) sets `err.code`
+// with no numeric `.status`; a timeout kill sets `err.signal`; a normal nonzero exit
+// (lsof ran, found nothing) sets `err.status` to a number and leaves
+// `err.code`/`err.signal` unset. Only the last of these means "confirmed
+// unused" — the first two fail CLOSED (report in-use, skip deletion).
+function isDirInUse(dirPath, { execFileSyncImpl = execFileSync } = {}) {
+  // lsof's EXIT CODE is not the "found something" signal on its own: a `+D`
+  // recursive scan exits 1 on a permission-denied subdirectory it merely
+  // warned about, even when it found and printed real open-file rows for the
+  // path we actually asked about. Stdout content is checked in both the
+  // success and thrown-error paths, since execFileSync still attaches
+  // `.stdout` to the error it throws on a non-zero exit.
+  try {
+    const out = execFileSyncImpl('lsof', ['+D', dirPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    })
+    return out.trim().length > 0
+  } catch (err) {
+    if (err.stdout && err.stdout.trim().length > 0) return true
+    // Only an exit status proves lsof ran to completion; a spawn error
+    // (ENOENT, EACCES, ...) or a timeout kill fails closed.
+    if (typeof err.status !== 'number' || err.signal) return true
+    return false // ran, exited nonzero, no output — confirmed nothing has it open
+  }
+}
+
+// Reap this machine's own orphaned meteor-test-run* build dirs older than
+// STALE_TEMP_DIR_MAX_AGE_MS. Injectable for tests (fsImpl/tmpDir/now) so the
+// unit test never touches the real OS tmpdir.
+function reapStaleTempDirs({
+  tmpDir = os.tmpdir(),
+  maxAgeMs = STALE_TEMP_DIR_MAX_AGE_MS,
+  now = Date.now,
+  fsImpl = fs,
+  isInUse = isDirInUse,
+  quiet = false,
+} = {}) {
+  const reaped = []
+  let entries
+  try {
+    entries = fsImpl.readdirSync(tmpDir)
+  } catch {
+    return reaped
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith('meteor-test-run')) continue
+    const fullPath = path.join(tmpDir, entry)
+    let stat
+    try {
+      stat = fsImpl.statSync(fullPath)
+    } catch {
+      continue
+    }
+    if (now() - stat.mtime.getTime() < maxAgeMs) continue
+    if (isInUse(fullPath)) continue
+    try {
+      fsImpl.rmSync(fullPath, { recursive: true, force: true })
+      reaped.push(fullPath)
+    } catch {
+      // Removed or permission-denied between the stat and the rm — fine,
+      // nothing to reap either way.
+    }
+  }
+  if (!quiet && reaped.length > 0) {
+    console.log(`${colors.dim}Reaped ${reaped.length} stale meteor-test-run* dir(s) from a prior daemon${colors.reset}`)
+  }
+  return reaped
 }
 
 // Start daemon in background
@@ -1045,6 +1182,8 @@ async function startDaemon(quiet = false) {
       fs.mkdirSync(logDir, { recursive: true })
     }
 
+    reapStaleTempDirs({ quiet })
+
     logDaemonEvent('startup-begin', {
       pid_file: pidFile,
       log_file: logFile,
@@ -1079,7 +1218,7 @@ async function startDaemon(quiet = false) {
       const child = spawn('npm', ['run', 'test:daemon'], {
         detached: true,
         stdio: ['ignore', out, err],
-        cwd: process.cwd(),
+        cwd: PROJECT_ROOT,
       })
 
       writePid(child.pid)
@@ -1281,50 +1420,231 @@ async function startDaemon(quiet = false) {
   }
 }
 
-// Stop daemon
-async function stopDaemon(quiet = false) {
-  const pid = readPid()
-  if (pid && isProcessRunning(pid)) {
+/**
+ * PIDs LISTENING on this worktree's daemon port, via lsof. This is the
+ * stop-by-port fallback, and — via pidfileIdentityVerified below — the
+ * signal that vetoes a stale pidfile PID before it gets group-signalled.
+ *
+ * Listener-only (-sTCP:LISTEN) on purpose: a bare `lsof -ti:<port>` also
+ * returns established CLIENT sockets on that port, and this harness's own
+ * process is one — harness.mjs's health()/fileMap() fetch the daemon
+ * in-process. A client socket must never be able to authorize a signal
+ * (fo-pi0kl: that gap self-SIGTERMed the test runner mid-suite).
+ */
+function getPortHolderPids(targetPort = port) {
+  try {
+    const result = execSync(`lsof -nP -iTCP:${targetPort} -sTCP:LISTEN -t`).toString().trim()
+    return result ? result.split('\n').map((p) => parseInt(p, 10)) : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The command line of a live pid, via ps. Used only when no port holder
+ * exists to compare the pidfile pid against — see pidfileIdentityVerified.
+ */
+function getProcessCommandLine(pid) {
+  try {
+    return execSync(`ps -o command= -p ${pid}`).toString().trim()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The process group id of a live pid, via ps. Null if ps fails (pid already
+ * gone) or the output isn't a number — read as "not evidence", same as every
+ * other null here, never as a match. See pidfileIdentityVerified: startDaemon
+ * spawns the pidfile pid with `detached: true`, making it a process group
+ * leader, so every real descendant — including the listener grandchild —
+ * shares its pgid.
+ */
+function getProcessGroupId(pid) {
+  try {
+    const pgid = parseInt(execSync(`ps -o pgid= -p ${pid}`).toString().trim(), 10)
+    return Number.isNaN(pgid) ? null : pgid
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Pure core: does this command line look like OUR daemon — `npm run
+ * test:daemon`, per startDaemon's spawn call — rather than whatever the
+ * kernel handed this pid after the real daemon exited? Deliberately narrow:
+ * a bare 'node', an empty string, or null (ps failed / pid already gone)
+ * all read as false. An unmatched command line is not evidence of
+ * anything; it is simply not evidence FOR trusting this pid.
+ */
+function looksLikeDaemonProcess(commandLine) {
+  return typeof commandLine === 'string' && commandLine.includes('test:daemon')
+}
+
+/**
+ * Pure core: should stopDaemon trust the pidfile PID enough to
+ * process-group-signal it?
+ *
+ * The pidfile is not self-identifying — nothing in the repo keeps it in
+ * sync with a crashed daemon (see stop-stale-daemon.sh), and the kernel
+ * reuses PIDs — so "the pidfile says N and N is alive" only ever proved
+ * liveness, never identity. That was tolerable while stopDaemon only ran
+ * from a human typing `daemon stop`. restartDeadWatcherIfNeeded now calls
+ * it automatically, so a reused PID can get process-group-signalled with no
+ * one deciding to do it (fo-pi0kl).
+ *
+ * The process actually LISTENING on this worktree's daemon port is
+ * self-identifying, but comparing raw pids is too strict: the pidfile holds
+ * the DETACHED WRAPPER's pid (npm, per startDaemon), while the port is bound
+ * by its grandchild (the meteor-tool process npm eventually execs into), so
+ * a genuinely healthy daemon's own pid never appears in the listener list at
+ * all — confirmed live (pidfile pid, listener pid three levels down, both
+ * under the pidfile pid's own pgid). Compare process GROUPS instead:
+ * `detached: true` makes the pidfile pid a group leader, so every real
+ * descendant inherits its pgid. Trust the pidfile pid only when some
+ * listener shares its group, veto it the instant a listener's group differs
+ * — group-signalling the pidfile pid then would hit whatever the kernel
+ * later gave that number, not the daemon.
+ *
+ * No listener at all (a crashed daemon whose port already dropped, or
+ * simply nothing running) is a different case: absence of a listener is
+ * absence of evidence, not evidence of identity, so it must NOT fall back
+ * to blind trust. Instead fall back to the one signal still available —
+ * does the pid's own command line look like this daemon.
+ */
+function pidfileIdentityVerified(pidfileGroupId, listenerGroupIds, commandLine) {
+  if (listenerGroupIds.length) {
+    return pidfileGroupId != null && listenerGroupIds.includes(pidfileGroupId)
+  }
+  return looksLikeDaemonProcess(commandLine)
+}
+
+function describeProcess(pid) {
+  try {
+    return execSync(`ps -o comm= -p ${pid} 2>/dev/null || true`).toString().trim() || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+// Poll (bounded) for the daemon's tracked pid to die AND the port to clear
+// before letting the caller report success. fo-fxz1c: `daemon stop` used to
+// print "Daemon stopped" right after sending SIGTERM while 8 children (the
+// daemon, mongo, 4x daemon-watcher) kept running and holding the port — the
+// next cold start then failed until each PID was killed by hand. Injectable
+// for tests (isAlive/portBoundPids/sleep) so this never spawns a real daemon.
+async function waitForTermination({
+  pid,
+  timeoutMs = 5000,
+  pollMs = 200,
+  isAlive = isProcessRunning,
+  portBoundPids = getPortHolderPids,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs))
+  let stillAlive = pid ? isAlive(pid) : false
+  let stillBound = portBoundPids()
+  for (
+    let attempt = 0;
+    (stillAlive || stillBound.length > 0) && attempt < maxAttempts;
+    attempt++
+  ) {
+    await sleep(pollMs)
+    stillAlive = pid ? isAlive(pid) : false
+    stillBound = portBoundPids()
+  }
+  const alivePids = []
+  if (stillAlive) alivePids.push(pid)
+  for (const p of stillBound) {
+    if (!alivePids.includes(p)) alivePids.push(p)
+  }
+  return { stopped: alivePids.length === 0, alivePids }
+}
+
+function reportStopResult(result, quiet) {
+  if (quiet) return
+  if (result.stopped) {
+    console.log(`${colors.green}Daemon stopped${colors.reset}`)
+    return
+  }
+  const roles = result.alivePids.map((p) => `${p} (${describeProcess(p)})`).join(', ')
+  console.log(`${colors.red}Daemon did not fully stop — still alive: ${roles}${colors.reset}`)
+}
+
+// Stop daemon. Returns true when nothing is left running (or nothing was
+// running), false when the process or port could not be confirmed clear within
+// the timeout — callers (`stop`, `restart`) must not treat that as success
+// (fo-fxz1c). Dependencies are injectable so the identity-check wiring can be
+// unit-tested — see tests/unit/stopDaemonIdentity.test.mjs.
+async function stopDaemon(quiet = false, {
+  readPidFile = readPid,
+  isRunning = isProcessRunning,
+  getPortHolders = getPortHolderPids,
+  getCommandLine = getProcessCommandLine,
+  getGroupId = getProcessGroupId,
+  killGroup = terminateProcess,
+  killPid = (p) => process.kill(p, 'SIGTERM'),
+  clearPidFile = removePid,
+  waitForTerm = waitForTermination,
+} = {}) {
+  const pid = readPidFile()
+  const alive = Boolean(pid) && isRunning(pid)
+  const portPids = getPortHolders(port)
+  // Only shell out for a command line when there is no port holder to
+  // check against instead — the common (matched or mismatched) case never
+  // needs it.
+  const commandLine = alive && !portPids.length ? getCommandLine(pid) : null
+  // Group ids only matter when there's a listener to compare the pidfile
+  // pid's group against — see pidfileIdentityVerified.
+  const pidfileGroupId = alive && portPids.length ? getGroupId(pid) : null
+  const listenerGroupIds = portPids.length ? portPids.map(getGroupId) : []
+
+  if (alive && pidfileIdentityVerified(pidfileGroupId, listenerGroupIds, commandLine)) {
     if (!quiet) {
       console.log(`${colors.yellow}Stopping daemon (PID: ${pid})...${colors.reset}`)
     }
     // Kill the process group to get all child processes
-    terminateProcess(pid)
-    removePid()
+    killGroup(pid)
+    clearPidFile()
+    const result = await waitForTerm({ pid })
+    reportStopResult(result, quiet)
+    return result.stopped
+  }
+
+  if (alive) {
+    // pid is alive but could not be verified as the daemon — either a
+    // different pid holds this worktree's port, or (with no port holder to
+    // check) its command line doesn't look like the daemon either. Either
+    // way the kernel most likely reused this pid for something else; never
+    // group-signal it. Clear the pidfile now so it can't be trusted again
+    // by mistake — unless a real port holder is about to be found and
+    // killed below, which clears it anyway.
+    if (!portPids.length) clearPidFile()
     if (!quiet) {
-      console.log(`${colors.green}Daemon stopped${colors.reset}`)
-    }
-  } else {
-    // Try to find and kill by port
-    try {
-      const result = execSync(`lsof -ti:${port}`).toString().trim()
-      if (result) {
-        const pids = result.split('\n')
-        for (const p of pids) {
-          try {
-            process.kill(parseInt(p, 10), 'SIGTERM')
-            if (!quiet) {
-              console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
-            }
-          } catch {
-            // Process already dead
-          }
-        }
-        removePid()
-        if (!quiet) {
-          console.log(`${colors.green}Daemon stopped${colors.reset}`)
-        }
-      } else {
-        if (!quiet) {
-          console.log(`${colors.dim}No daemon running${colors.reset}`)
-        }
-      }
-    } catch {
-      if (!quiet) {
-        console.log(`${colors.dim}No daemon running${colors.reset}`)
-      }
+      console.log(`${colors.yellow}Ignoring PID file (${pid}) — could not verify it as the daemon${colors.reset}`)
     }
   }
+
+  if (portPids.length) {
+    for (const p of portPids) {
+      try {
+        killPid(p)
+        if (!quiet) {
+          console.log(`${colors.yellow}Killed process ${p} on port ${port}${colors.reset}`)
+        }
+      } catch {
+        // Process already dead
+      }
+    }
+    clearPidFile()
+    const termination = await waitForTerm({ pid: null })
+    reportStopResult(termination, quiet)
+    return termination.stopped
+  }
+  if (!quiet) {
+    console.log(`${colors.dim}No daemon running${colors.reset}`)
+  }
+  return true
 }
 
 // Show daemon status
@@ -1371,19 +1691,23 @@ async function handleDaemonCommand(cmd) {
       process.exit(0)
       break
     case 'stop':
-      await stopDaemon()
-      process.exit(0)
+      process.exit((await stopDaemon()) ? 0 : 1)
       break
     case 'status':
       await daemonStatus()
       process.exit(0)
       break
-    case 'restart':
-      await stopDaemon()
+    case 'restart': {
+      const stopped = await stopDaemon()
+      if (!stopped) {
+        console.error(`${colors.red}Refusing to start a replacement daemon — the prior one did not fully stop${colors.reset}`)
+        process.exit(1)
+      }
       await new Promise(r => setTimeout(r, 1000))
       await startDaemon()
       process.exit(0)
       break
+    }
     case 'logs':
       const tailMode = args.includes('-t') || args.includes('--tail')
       if (fs.existsSync(logFile)) {
@@ -1567,12 +1891,25 @@ Examples:
   runTests()
 }
 
-// Max time to wait for a rebuild to catch up to a just-edited file before we
-// declare the daemon wedged. Healthy full-app rebuilds on a loaded machine were
-// observed at 45–60s, so this budget errs long: a genuinely wedged watcher never
-// rebuilds, so over-waiting only delays the warning, while under-waiting cries
-// wolf on a slow-but-healthy rebuild (far worse — it trains people to ignore it).
-const STALE_WAIT_MS = +(process.env.TEST_DAEMON_STALE_WAIT_MS || 120000)
+// Time allowed for the rspack watcher to notice an edit and start a rebuild.
+// Once it starts, the build stamp says so and we wait as long as it takes, so
+// this budget only covers the gap between saving a file and the watcher
+// reacting. A watcher that never reacts is wedged, and now we can say so in
+// seconds instead of guessing for two minutes.
+const WATCH_NOTICE_MS = +(process.env.TEST_DAEMON_WATCH_NOTICE_MS || 8000)
+// Backstop for a rebuild that IS running but never finishes. Only a hung
+// compile reaches this.
+const REBUILD_WAIT_MS = +(process.env.TEST_DAEMON_REBUILD_WAIT_MS || 300000)
+// Where the Meteor/rspack integration emits its bundles. The daemon runs with
+// RSPACK_BUILD_CONTEXT=_build-daemon; that env doesn't reach this client, so
+// default to the same value and allow an override for other setups.
+const BUILD_CONTEXT_DIR =
+  process.env.TEST_DAEMON_BUILD_CONTEXT || process.env.RSPACK_BUILD_CONTEXT || '_build-daemon'
+// The daemon runs server tests only, so only the server bundle's inputs decide
+// whether its suite is current. The client stamp is deliberately ignored:
+// Tailwind's content glob pulls docs, .beads and .claude into the client
+// dependency graph, so a `bd` write would read as a stale test suite.
+const BUILD_SIDES = ['server']
 
 /** Fetch /test/health as JSON, or null on any error/timeout. */
 function getHealthJson() {
@@ -1597,92 +1934,252 @@ function getHealthJson() {
 }
 
 /**
- * Pure core of the staleness guard: given the targeted spec's mtime, the newest
- * project-source mtime, and the daemon's builtAt, return the source mtime that
- * should be compared against builtAt — or null when nothing on disk is newer
- * than the last build (definitely fresh).
- *
- * We fold in the project mtime because comparing only the targeted spec misses
- * the common TDD loop: edit an implementation file under imports/ (or server//
- * client/), then rerun the *same* spec without touching it. The spec's mtime is
- * still <= builtAt, so a spec-only check reports fresh even when a wedged
- * watcher is serving a bundle that predates the impl edit. The impl file is the
- * thing that changed, so its mtime is what must gate freshness.
- */
-function computeStaleBasis({ targetMtime, projectMtime, builtAt }) {
-  // The newest source on disk is what a healthy rebuild must catch up to. Using
-  // anything less (e.g. only the spec when an impl file is newer still) would
-  // let the wait loop declare "fresh" once builtAt passes the spec while the
-  // newer impl edit remains unbuilt — the same lie, one file over.
-  const newest = Math.max(targetMtime, projectMtime)
-  return newest > builtAt ? newest : null
-}
-
-/**
  * An unstattable target splits two ways: a *bare filename* (no separator) is a
  * partial pattern the daemon resolves via suite matching — legitimate, so we
- * fall back to the project mtime. An *exact path* (has a separator) that can't
- * be statted means the user named a concrete spec that's been deleted/renamed;
- * getProjectMtime only sees files that still exist, so it can't prove the
- * daemon isn't still running the removed spec. Treat that as a hard stale.
+ * fall back to the build stamp alone. An *exact path* (has a separator) that
+ * can't be statted means the user named a concrete spec that's been
+ * deleted/renamed, so the daemon may still be running the removed spec. Treat
+ * that as a hard stale.
  */
 function isMissingExactTarget(pattern) {
   return pattern.includes('/') || pattern.includes(path.sep)
 }
 
+/** Parse a JSON file, or null if it is absent or unreadable. */
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Read every build stamp under the build-context directory
+ * (`_build-daemon/<mode>/.build-stamp-<side>.json`), paired with the
+ * compiler's current state from the sibling `.build-state-<side>.json`.
+ *
+ * The stamps are written by BuildStampPlugin in the app's rspack.config.js.
+ * An app without that plugin has no stamps, which the caller reports as
+ * unknown freshness — never as fresh.
+ */
+function readBuildStamps(cwd = PROJECT_ROOT, contextDir = BUILD_CONTEXT_DIR) {
+  const root = path.join(cwd, contextDir)
+  const stamps = []
+  let modes
+  try {
+    modes = fs.readdirSync(root, { withFileTypes: true })
+  } catch {
+    return stamps
+  }
+  for (const mode of modes) {
+    if (!mode.isDirectory()) continue
+    for (const side of BUILD_SIDES) {
+      const dir = path.join(root, mode.name)
+      const stamp = readJsonFile(path.join(dir, `.build-stamp-${side}.json`))
+      if (!stamp || !Array.isArray(stamp.inputs)) continue
+      const state = readJsonFile(path.join(dir, `.build-state-${side}.json`))
+      stamps.push({ bundle: `${mode.name}/${side}`, stamp, state: state?.state || 'ok' })
+    }
+  }
+  return stamps
+}
+
+const SKIP_DIRS = /^(node_modules|_build.*)$/
+
+// Explicit code-unit ordering, mirroring byPath in rspack.buildStamp.mjs. A
+// locale-dependent comparator would make the hash depend on the machine and
+// every run would read stale.
+const byPath = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+
+/**
+ * A watched directory's identity: every path beneath it. The walk is recursive
+ * because rspack forwards a context dependency as a recursive watch — `imports`
+ * stands in for the whole tree under it, so a shallow listing misses a spec
+ * added two levels down.
+ *
+ * MIRRORED from hashDirTree in the app's rspack.buildStamp.mjs. The stamp
+ * records what the compiler saw and this recomputes it, so the two must agree
+ * exactly or every run reports stale.
+ */
+function hashDirTree(dir) {
+  const paths = []
+  const walk = (current, prefix) => {
+    let entries
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      if (entry.isDirectory() && SKIP_DIRS.test(entry.name)) continue
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name
+      paths.push(rel)
+      if (entry.isDirectory()) walk(path.join(current, entry.name), rel)
+    }
+  }
+  if (!fs.existsSync(dir)) return null
+  walk(dir, '')
+  paths.sort(byPath)
+  return crypto.createHash('sha1').update(paths.join('\n')).digest('hex')
+}
+
+/**
+ * Compare the whole recorded input set against disk. Returns the newest file
+ * mtime now on disk, the first recorded file that has since disappeared, the
+ * first watched directory whose listing changed, and the first path the build
+ * looked for and did not find that now exists.
+ *
+ * Directories compare by listing rather than mtime on purpose. Creating and
+ * removing a scratch file inside one moves its mtime while leaving the listing
+ * identical; rspack compares contents and does not rebuild, so an mtime check
+ * would wait for a rebuild that never comes and cry wedged on a healthy
+ * daemon — observed on a live daemon while building this.
+ */
+function scanStampInputs(stamp, cwd = PROJECT_ROOT) {
+  let newest = 0
+  let missing = null
+  for (const rel of stamp.inputs) {
+    try {
+      const { mtimeMs } = fs.statSync(path.join(cwd, rel))
+      if (mtimeMs > newest) newest = mtimeMs
+    } catch {
+      if (!missing) missing = rel
+    }
+  }
+  let changedDir = null
+  for (const [rel, hash] of Object.entries(stamp.dirs || {})) {
+    if (hashDirTree(path.join(cwd, rel)) !== hash) {
+      changedDir = rel
+      break
+    }
+  }
+  const appeared = (stamp.absent || []).find((rel) => fs.existsSync(path.join(cwd, rel)))
+  return { newest, missing, changedDir, appeared: appeared || null }
+}
+
+/**
+ * Pure core: is one bundle behind what is on disk?
+ *
+ * `newestInputMtime` is what the compiler saw while reading its inputs, so any
+ * recorded input now newer than that was edited after the build. A recorded
+ * input that has vanished is stale too — the bundle still contains it.
+ * A path the build looked for and did not find, that now exists, is a change
+ * the input list can never show. `targetMtime` covers the same shape for a
+ * file the user named explicitly.
+ */
+function classifyStampFreshness({
+  stamp,
+  newestOnDisk,
+  missingInput,
+  changedDir,
+  appearedInput,
+  targetMtime = 0,
+}) {
+  if (missingInput) return { stale: true, deleted: missingInput }
+  if (changedDir) return { stale: true, changedDir }
+  if (appearedInput) return { stale: true, appeared: appearedInput }
+  const newest = Math.max(newestOnDisk, targetMtime)
+  if (newest <= stamp.newestInputMtime) return { stale: false }
+  return { stale: true, mtimeMs: newest }
+}
+
+/**
+ * Pure core: fold every bundle's verdict into one. Stale if any bundle is
+ * stale; `building` and `failed` describe what the compiler is doing about it,
+ * which is what decides whether waiting is worth anything.
+ */
+function evaluateStamps(entries, targetMtime = 0, cwd = PROJECT_ROOT) {
+  let worst = null
+  let building = false
+  let failed = null
+  for (const entry of entries) {
+    if (entry.state === 'building') building = true
+    const { newest, missing, changedDir, appeared } = scanStampInputs(entry.stamp, cwd)
+    const verdict = classifyStampFreshness({
+      stamp: entry.stamp,
+      newestOnDisk: newest,
+      missingInput: missing,
+      changedDir,
+      appearedInput: appeared,
+      targetMtime,
+    })
+    if (!verdict.stale) continue
+    if (entry.state === 'failed') failed = entry.bundle
+    if (!worst || (verdict.mtimeMs || 0) > (worst.mtimeMs || 0)) {
+      worst = { ...verdict, bundle: entry.bundle, builtAt: entry.stamp.builtAt }
+    }
+  }
+  if (!worst) return { stale: false, building, failed }
+  return { ...worst, building, failed }
+}
+
 /**
  * Staleness guard. A wedged Meteor watcher keeps serving the last-built suite
- * while /test/health still reports "ready" — so a file-targeted run can return
- * confident pass/fail for code that no longer exists on disk (observed: a test
- * title that had been renamed away still "ran"). Compare the newest relevant
- * source mtime (the target spec OR any project file under imports//server//
- * client/) to the daemon's builtAt (its rebuild timestamp). If disk is newer,
- * a rebuild is either in flight (builtAt will catch up in seconds — we wait) or
- * the watcher is wedged (builtAt never catches up — we report stale instead of
- * lying). Only applies to file-targeted runs; older daemons without builtAt are
- * skipped (backward compatible). See computeStaleBasis for why the project
- * mtime is folded in, not just the spec's.
+ * while /test/health still reports "ready" — so a run returns confident
+ * pass/fail for code that no longer exists on disk (observed: a test title
+ * that had been renamed away still "ran").
+ *
+ * The build reports its own inputs (see BuildStampPlugin), so freshness is a
+ * fact lookup: stat what the compiler read, compare against what it saw. The
+ * old guard reconstructed the input set from a hand-written list of source
+ * roots and extensions; any drift from rspack's real watch set gave a wrong
+ * answer in both directions — false wedges that blocked pushes, and silent
+ * false "fresh" on a genuinely stale suite (fo-zdpf0).
+ *
+ * The wait is now bounded by evidence rather than by a fixed budget: while the
+ * compiler says `building` we wait for it, and when it says otherwise a stale
+ * bundle means the watcher never noticed the edit.
+ *
+ * KNOWN GAP (fo-81ow2): the stamp says what was COMPILED, not what the daemon
+ * is running. Meteor restarts after the compile, so a run dispatched in that
+ * ~10s window reads fresh against the previous bundle. Gating on
+ * `health.builtAt >= stamp.builtAt` was tried and reverted — a
+ * content-identical rebuild advances the stamp without rewriting the bundle,
+ * so Meteor never restarts and the check can never clear. Closing this needs a
+ * build generation both sides can name, not a timestamp.
  */
 async function ensureDaemonFresh() {
-  if (!filePattern) return { stale: false }
+  // Nothing is running, so nothing stale can be served: the guard does not
+  // apply and startup is about to build from current sources anyway.
+  //
+  // This is load-bearing, not an optimisation. The stamp outlives the daemon —
+  // it is a file in the build directory — so a stopped daemon plus an edited
+  // tree reads as stale forever, and the run exits 2 BEFORE it would have
+  // started the daemon that clears it. That bricks `test-run daemon stop &&
+  // test-run`, which is the recovery path this very error message recommends.
+  if (!(await getHealthJson())) return { stale: false }
+
   // filePattern may be a *partial* path — the documented `-f Foo.app-spec.ts`
   // and bare-positional workflows pass a filename the daemon resolves via suite
   // matching, so a direct stat throws. Don't bail to "fresh" in that case: the
-  // project mtime (which globs imports//server//client/, where specs live) still
-  // gates freshness. Default targetMtime to 0 so computeStaleBasis leans on it.
+  // recorded input list still gates freshness on its own.
   let targetMtime = 0
-  try {
-    targetMtime = fs.statSync(path.join(process.cwd(), filePattern)).mtimeMs
-  } catch {
-    // Exact path that's gone → the daemon may still hold the removed spec and
-    // we can't verify otherwise: hard stale, no point waiting for a rebuild
-    // that won't bring the file back. Bare filename → partial pattern, fall
-    // through and let the project mtime guard it.
-    if (isMissingExactTarget(filePattern)) {
-      return { stale: true, missing: true }
+  if (filePattern) {
+    try {
+      targetMtime = fs.statSync(path.join(PROJECT_ROOT, filePattern)).mtimeMs
+    } catch {
+      // Exact path that's gone → the daemon may still hold the removed spec and
+      // we can't verify otherwise: hard stale, no point waiting for a rebuild
+      // that won't bring the file back. Bare filename → partial pattern, fall
+      // through and let the stamps guard it.
+      if (isMissingExactTarget(filePattern)) {
+        return { stale: true, missing: true }
+      }
     }
-    targetMtime = 0
   }
-  const first = await getHealthJson()
-  if (!first || typeof first.builtAt !== 'number') return { stale: false }
-  const projectMtime = await getProjectMtime()
-  const mtimeMs = computeStaleBasis({
-    targetMtime,
-    projectMtime,
-    builtAt: first.builtAt,
-  })
-  if (mtimeMs === null) return { stale: false }
 
-  const deadline = Date.now() + STALE_WAIT_MS
-  while (Date.now() <= deadline) {
+  const noticeDeadline = Date.now() + WATCH_NOTICE_MS
+  const hardDeadline = Date.now() + REBUILD_WAIT_MS
+  for (;;) {
+    const entries = readBuildStamps()
+    if (!entries.length) return { unknown: true }
+    const verdict = evaluateStamps(entries, targetMtime)
+    if (!verdict.stale) return { stale: false }
+    if (Date.now() > (verdict.building ? hardDeadline : noticeDeadline)) return verdict
     await new Promise((r) => setTimeout(r, 500))
-    const h = await getHealthJson()
-    // null health = server restarting mid-rebuild → keep waiting.
-    if (h && typeof h.builtAt === 'number' && mtimeMs <= h.builtAt) {
-      return { stale: false }
-    }
   }
-  return { stale: true, mtimeMs, builtAt: first.builtAt }
 }
 
 /**
@@ -1748,37 +2245,135 @@ function reportWedgedEmptyBundle(grep) {
   process.exitCode = 2
 }
 
+const DAEMON_FIX_HINT = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
+
+/**
+ * Pure core: turn a stale verdict into the one sentence that explains it. The
+ * shapes differ in what the user should do about them, so they are worth
+ * telling apart — a failed compile wants the build log, a wedged watcher wants
+ * a restart.
+ */
+function describeStaleness(freshness, pattern) {
+  if (freshness.missing) {
+    return `Target not found: ${pattern} does not exist on disk (deleted/renamed?). The daemon may still be running the old spec, so results can't be trusted.`
+  }
+  if (freshness.failed) {
+    return `Last build of ${freshness.failed} FAILED, so the daemon is still serving the bundle from before your edit.`
+  }
+  if (freshness.deleted) {
+    return `${freshness.deleted} was deleted but is still compiled into ${freshness.bundle}. The daemon is serving a stale suite.`
+  }
+  if (freshness.changedDir) {
+    return `${freshness.changedDir}/ gained or lost a file since ${freshness.bundle} was compiled. The daemon is serving a stale suite.`
+  }
+  if (freshness.appeared) {
+    return `${freshness.appeared} now exists but ${freshness.bundle} was compiled without it. The daemon is serving a stale suite.`
+  }
+  const lag = Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)
+  if (freshness.building) {
+    return `A rebuild of ${freshness.bundle} has been running for over ${Math.round(REBUILD_WAIT_MS / 1000)}s and has not finished. The daemon is still serving code from ~${lag}s before your edit.`
+  }
+  return `Daemon appears wedged: source changed ~${lag}s after ${freshness.bundle} was last compiled, and the watcher did not start a rebuild within ${Math.round(WATCH_NOTICE_MS / 1000)}s. It is serving a stale suite.`
+}
+
+/**
+ * Pure core: decide whether a stale verdict is a DEAD watcher — one that
+ * never noticed the edit at all — rather than a rebuild that is merely in
+ * flight or wedged (freshness.building) or a user error (freshness.missing).
+ * Those two are refuse-and-report cases; a dead watcher cannot recover on its
+ * own, so it is the one case worth one automatic restart.
+ *
+ * `alreadyAttempted` is the loop guard: a dead watcher this function already
+ * said yes to, where the restart did not clear the condition, must report and
+ * exit like today rather than restart again. It is checked first so nothing
+ * below can accidentally bypass it.
+ */
+function shouldRestartDeadWatcher(freshness, alreadyAttempted) {
+  if (alreadyAttempted) return false
+  if (!freshness.stale) return false
+  if (freshness.building) return false
+  if (freshness.missing) return false
+  return true
+}
+
+/**
+ * Decide-and-act step for the dead-watcher restart, extracted out of
+ * runTests() so the wiring is testable without a running daemon: `stop`,
+ * `start` and `recheck` are the side effects, injectable with fakes and
+ * defaulting to the real stopDaemon/startDaemon/ensureDaemonFresh.
+ *
+ * Called at most once per runTests() invocation (never from a loop), so
+ * passing `false` for shouldRestartDeadWatcher's alreadyAttempted is always
+ * correct here — that guard exists for the predicate's own contract, not
+ * because this function retries.
+ *
+ * Returns the freshness to carry forward: the rechecked verdict after a
+ * restart (whether or not it cleared), or the original verdict untouched
+ * when no restart was warranted or the daemon failed to start.
+ */
+async function restartDeadWatcherIfNeeded(freshness, {
+  stop = stopDaemon,
+  start = startDaemon,
+  recheck = ensureDaemonFresh,
+  wait = () => new Promise((r) => setTimeout(r, 1000)),
+} = {}) {
+  if (!shouldRestartDeadWatcher(freshness, false)) return freshness
+
+  // A dead watcher never enters "building" during ensureDaemonFresh's wait,
+  // so nothing will fix this on its own. Restart once and recheck. Always on
+  // stderr, in both modes — see fo-23gyk, which needs this traceable rather
+  // than silently self-healed.
+  const restartMessage = `⚠ Test daemon watcher appears DEAD (source changed but no rebuild ever started) — restarting the daemon once.`
+  console.error(jsonMode ? restartMessage : `\n${colors.yellow}${restartMessage}${colors.reset}`)
+  watcherRestarted = true
+
+  await stop(jsonMode)
+  await wait()
+  const startResult = await start(jsonMode)
+  if (startResult !== true) return freshness
+
+  return await recheck()
+}
+
 async function runTests() {
   // Refuse to serve results from a wedged daemon (stale bundle). See
-  // ensureDaemonFresh — a slow-but-healthy rebuild waits, a wedged one reports.
-  const freshness = await ensureDaemonFresh()
+  // ensureDaemonFresh — a rebuild in flight waits, a wedged one reports.
+  let freshness = await ensureDaemonFresh()
+  if (freshness.unknown) {
+    // No build stamps: this app's rspack.config.js has no BuildStampPlugin, so
+    // freshness cannot be established. Say so rather than imply "fresh".
+    freshnessUnknown = true
+    if (!jsonMode) {
+      console.error(
+        `${colors.yellow}⚠ Cannot verify daemon freshness — no build stamp under ${BUILD_CONTEXT_DIR}/. Results may reflect old code.${colors.reset}`,
+      )
+    }
+  }
+
+  freshness = await restartDeadWatcherIfNeeded(freshness)
+
   if (freshness.stale) {
-    const fix = `Restart it: ./scripts/test-run daemon stop (auto-restarts next run). Logs: ./scripts/test-run daemon logs -t`
-    // Two stale shapes: a concrete target that's gone (missing), or a wedged
-    // watcher whose builtAt never caught up to a newer source (lag).
-    const staleError = freshness.missing
-      ? `Target not found: ${filePattern} does not exist on disk (deleted/renamed?). The daemon may still be running the old spec, so results can't be trusted. ${fix}`
-      : `Daemon appears wedged: ${filePattern} was modified ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the daemon last rebuilt, and no rebuild landed within ${Math.round(STALE_WAIT_MS / 1000)}s. It is serving a stale suite. ${fix}`
+    const staleError = `${describeStaleness(freshness, filePattern)} ${DAEMON_FIX_HINT}`
     if (jsonMode) {
       printMachineOutput({
         success: false,
         stale: true,
         error: staleError,
-        file: filePattern,
+        file: filePattern || null,
       })
     } else {
-      const headline = freshness.missing
-        ? `\n${colors.red}⚠ Target not found${colors.reset} — ${filePattern} is not on disk. The daemon may still hold the old spec; results would reflect a file that no longer exists.`
-        : `\n${colors.red}⚠ Test daemon appears STALE${colors.reset} — ${filePattern} changed ~${Math.round((freshness.mtimeMs - freshness.builtAt) / 1000)}s after the last rebuild and none has landed. Results would reflect OLD code.`
-      console.error(headline)
-      console.error(`${colors.yellow}${fix}${colors.reset}\n`)
+      const label = freshness.missing ? 'Target not found' : 'Test daemon appears STALE'
+      console.error(`\n${colors.red}⚠ ${label}${colors.reset} — ${describeStaleness(freshness, filePattern)}`)
+      console.error(`${colors.yellow}${DAEMON_FIX_HINT}${colors.reset}\n`)
     }
     process.exitCode = 2
     return
   }
 
-  // Check cache for full test runs (no grep, no file filter, no invert)
-  // Cache checks file mtimes, so changed files will invalidate it automatically
+  // Only a full run is ever saved, so a grep or file-filtered query cannot be
+  // served from the cache whatever its age. That is what this gate is for.
+  // Staleness is separate: the cache is keyed to the server build stamp, so a
+  // rebuild invalidates it.
   const isFullRun = testNamePatterns.length === 0 && !filePattern && !invert
   const noCache = args.includes('--no-cache')
 
@@ -1825,7 +2420,6 @@ async function runTests() {
   let exitCode = 0
   let outputBuffer = ''
   let failureCount = 0
-  let cachePromise = null
   let retrying = false
   let jsonResult = null // Parsed JSON from Mocha reporter
   let startTime = Date.now()
@@ -2217,9 +2811,9 @@ async function runTests() {
           }
         }
 
-        // Save to cache for full runs (store promise to await later)
+        // Save to cache for full runs
         if (isFullRun) {
-          cachePromise = saveCache(outputBuffer, exitCode, failureCount, jsonResult)
+          saveCache(outputBuffer, exitCode, failureCount, jsonResult)
         }
         break
 
@@ -2378,11 +2972,6 @@ async function runTests() {
       // If retrying due to "already running", don't exit
       if (retrying) return
 
-      // Wait for cache to be saved before exiting
-      if (cachePromise) {
-        await cachePromise.catch(() => {}) // Ignore cache errors
-      }
-
       if (watchMode) {
         // Watch mode: wait for daemon restart, then re-run
         console.log(`${colors.cyan}Watching for changes... (Ctrl+C to exit)${colors.reset}`)
@@ -2457,6 +3046,8 @@ if (require.main === module) {
 
 module.exports = {
   main,
+  resolveProjectRoot,
+  acquireLock,
   createJsonProgressLogger,
   createRestartLoopTracker,
   shouldReportNoTestsMatched,
@@ -2465,17 +3056,35 @@ module.exports = {
   extractMochaJsonFromMixedOutput,
   summarizeFailures,
   buildLlmSummary,
+  derivePassFailCounts,
   finalizeJsonOutput,
   formatMachineOutput,
   printMachineOutput,
   isActivityEvent,
   parseDaemonHealthResponse,
   isMongoTimeoutMessage,
+  isDaemonErrorLine,
   touchHotReloadFile,
   waitForDaemonRestart,
-  computeStaleBasis,
   isMissingExactTarget,
-  getProjectMtime,
+  readBuildStamps,
+  scanStampInputs,
+  hashDirTree,
+  classifyStampFreshness,
+  evaluateStamps,
+  describeStaleness,
+  shouldRestartDeadWatcher,
+  restartDeadWatcherIfNeeded,
+  pidfileIdentityVerified,
+  looksLikeDaemonProcess,
+  stopDaemon,
   classifyDaemonFullness,
   isWedgedEmptyResult,
+  cacheBuildBasis,
+  checkCache,
+  saveCache,
+  reapStaleTempDirs,
+  isDirInUse,
+  waitForTermination,
+  stopDaemon,
 }
