@@ -75,16 +75,44 @@ const errorLineSnippets = [
   'heap out of memory',
 ]
 
-// Lines that contain an error-shaped snippet above but are not fatal to the
-// daemon. macOS logs 'Failed to start watcher for <path>: [Error: Error
-// starting FSEvents stream]' when a watcher can't attach under load — the
-// daemon keeps running and rebuilds normally, but the bare 'Error' snippet
-// above would otherwise score it as the crash (fo-a3v67).
+// Watcher failures have their own startup verdict; they are not process crashes.
 const benignLineSnippets = ['Failed to start watcher for']
 
 function isDaemonErrorLine(line) {
   if (benignLineSnippets.some(snippet => line.includes(snippet))) return false
   return errorLineSnippets.some(snippet => line.includes(snippet))
+}
+
+function detectWatcherStartFailure(logText) {
+  const line = logText.split('\n').find(entry =>
+    entry.includes('Failed to start watcher for') ||
+    entry.includes('Error starting FSEvents stream'),
+  )
+  return line?.trim() || null
+}
+
+function startupPollResult({ watcherFailure, processAlive, healthReady }) {
+  if (watcherFailure) return 'watcher-failed'
+  if (!processAlive) return 'crashed'
+  if (healthReady) return 'ready'
+  return null
+}
+
+function readLogSince(filePath, offset) {
+  try {
+    const size = fs.statSync(filePath).size
+    const start = size < offset ? 0 : offset
+    const buffer = Buffer.alloc(size - start)
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      fs.readSync(fd, buffer, 0, buffer.length, start)
+    } finally {
+      fs.closeSync(fd)
+    }
+    return buffer.toString('utf8')
+  } catch {
+    return ''
+  }
 }
 
 const mongoTimeoutSnippets = [
@@ -1176,6 +1204,9 @@ async function startDaemon(quiet = false) {
         console.log(`${colors.cyan}${label}${colors.reset}`)
       }
 
+      // Only this attempt's log bytes can establish a watcher startup failure.
+      const attemptLogOffset = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0
+
       // Start daemon in background
       const out = fs.openSync(logFile, 'a')
       const err = fs.openSync(logFile, 'a')
@@ -1213,11 +1244,23 @@ async function startDaemon(quiet = false) {
       let pollTick = 0
       let lastPhase = 'spawned'
       let extendedAnnounced = false
-      let result = null // one of 'ready' | 'crashed' | 'timeout'
+      let result = null // one of 'ready' | 'crashed' | 'timeout' | 'watcher-failed'
+      let watcherFailure = null
+      const checkWatcherFailure = () => {
+        watcherFailure = detectWatcherStartFailure(readLogSince(logFile, attemptLogOffset))
+        return watcherFailure
+      }
 
       while (true) {
         pollTick++
         const elapsedMs = Date.now() - startTime
+
+        result = startupPollResult({
+          watcherFailure: checkWatcherFailure(),
+          processAlive: isProcessRunning(daemonPid),
+          healthReady: false,
+        })
+        if (result) break
 
         // Hard ceiling — no amount of forward progress justifies waiting
         // longer than this for a single attempt.
@@ -1237,16 +1280,14 @@ async function startDaemon(quiet = false) {
           }, { quiet })
         }
 
-        // Process died mid-startup — typical rspack/processes.js crash
-        if (!isProcessRunning(daemonPid)) {
-          result = 'crashed'
-          break
-        }
-
         if (await isDaemonRunning()) {
           // Health check passed; give meteor a moment to settle.
           await new Promise(r => setTimeout(r, 500))
-          result = 'ready'
+          result = startupPollResult({
+            watcherFailure: checkWatcherFailure(),
+            processAlive: isProcessRunning(daemonPid),
+            healthReady: true,
+          })
           break
         }
 
@@ -1309,18 +1350,19 @@ async function startDaemon(quiet = false) {
       const recentLogs = getRecentLogs(50)
       const errorLines = recentLogs.filter(isDaemonErrorLine)
       const failureSnapshot = captureDiagnosticSnapshot(
-        result === 'crashed' ? 'post-crash' : 'post-timeout',
+        result === 'crashed' ? 'post-crash' : result === 'watcher-failed' ? 'post-watcher-failure' : 'post-timeout',
         daemonPid,
       )
 
       logDaemonEvent(
-        result === 'crashed' ? 'daemon-crashed' : 'startup-timeout',
+        result === 'crashed' ? 'daemon-crashed' : result === 'watcher-failed' ? 'watcher-start-failed' : 'startup-timeout',
         {
           attempt,
           daemon_pid: daemonPid,
           elapsed_ms: Date.now() - startTime,
           poll_ticks: pollTick,
           error_lines: errorLines.slice(-5),
+          watcher_failure: watcherFailure,
           snapshot: failureSnapshot,
         },
         { quiet },
@@ -1329,15 +1371,19 @@ async function startDaemon(quiet = false) {
       cleanupFailedStart(daemonPid)
       lastFailure = {
         started: false,
-        error: result === 'crashed' ? 'daemon_crashed' : 'startup_timeout',
-        message: errorLines.length > 0
+        error: result === 'watcher-failed'
+          ? 'watcher_failed_to_start'
+          : result === 'crashed' ? 'daemon_crashed' : 'startup_timeout',
+        message: watcherFailure
+          ? `Watcher failed to start: ${watcherFailure}`
+          : errorLines.length > 0
           ? errorLines.slice(-1)[0]
           : `Daemon ${result === 'crashed' ? 'crashed during startup' : 'failed to start within timeout'}`,
-        logs: errorLines.slice(-10),
+        logs: watcherFailure ? [watcherFailure] : errorLines.slice(-10),
       }
 
       // ── Retry decision ──────────────────────────────────────────
-      if (attempt < MAX_DAEMON_STARTUP_ATTEMPTS) {
+      if (result !== 'watcher-failed' && attempt < MAX_DAEMON_STARTUP_ATTEMPTS) {
         logDaemonEvent('will-retry', {
           attempt,
           next_attempt: attempt + 1,
@@ -1355,9 +1401,8 @@ async function startDaemon(quiet = false) {
 
       // ── Out of retries — surface the failure to the caller ──────
       if (!quiet) {
-        console.error(
-          `\n${colors.red}Daemon failed after ${MAX_DAEMON_STARTUP_ATTEMPTS} attempts (${lastFailure.error})${colors.reset}`,
-        )
+        console.log(`\n${colors.red}${lastFailure.message}${colors.reset}`)
+        console.error(`Daemon failed on attempt ${attempt} (${lastFailure.error})`)
         if (errorLines.length > 0) {
           console.error(`${colors.red}Error:${colors.reset}`)
           errorLines.slice(-5).forEach(line =>
@@ -3028,6 +3073,9 @@ module.exports = {
   parseDaemonHealthResponse,
   isMongoTimeoutMessage,
   isDaemonErrorLine,
+  detectWatcherStartFailure,
+  startupPollResult,
+  readLogSince,
   touchHotReloadFile,
   waitForDaemonRestart,
   isMissingExactTarget,
