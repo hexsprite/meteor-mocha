@@ -667,6 +667,7 @@ function setupDaemonEndpoints() {
       running: daemonTestsRunning,
       builtAt: BUILT_AT,
       generation: globalThis.__focusterTestBuildGeneration || null,
+      bundle: globalThis.__focusterTestBuildBundle || null,
     }));
   });
 

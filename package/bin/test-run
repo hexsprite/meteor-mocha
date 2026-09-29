@@ -2051,15 +2051,18 @@ function classifyStampFreshness({
 }
 
 /**
- * Pure core: fold every bundle's verdict into one. Stale if any bundle is
- * stale; `building` and `failed` describe what the compiler is doing about it,
- * which is what decides whether waiting is worth anything.
+ * Pure core: fold the loaded daemon's bundle verdicts into one. Other modes
+ * can leave stamps behind, but their generations cannot match this daemon.
+ * `building` and `failed` describe what its compiler is doing about staleness.
  */
-function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd(), loadedGeneration) {
+function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd(), loadedGeneration, loadedBundle) {
   let worst = null
   let building = false
   let failed = null
+  let matched = false
   for (const entry of entries) {
+    if (loadedBundle && entry.bundle !== loadedBundle) continue
+    matched = true
     if (entry.state === 'building') building = true
     const { newest, missing, changedDir, appeared } = scanStampInputs(entry.stamp, cwd)
     const verdict = classifyStampFreshness({
@@ -2094,6 +2097,7 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd(), loadedGen
       worst = { ...verdict, bundle: entry.bundle, builtAt: entry.stamp.builtAt }
     }
   }
+  if (loadedBundle && !matched) return { unknown: true }
   if (!worst) return { stale: false, building, failed }
   return { ...worst, building, failed }
 }
@@ -2172,7 +2176,11 @@ async function ensureDaemonFresh({
     healthUnavailableSince = null
     const entries = readStamps()
     if (!entries.length) return { unknown: true }
-    const verdict = evaluateStamps(entries, targetMtime, process.cwd(), health?.generation)
+    if (!health.bundle && entries.length > 1) {
+      return { stale: true, generationMissing: true }
+    }
+    const verdict = evaluateStamps(entries, targetMtime, process.cwd(), health.generation, health.bundle)
+    if (verdict.unknown) return verdict
     if (!verdict.stale) return { stale: false }
     if (verdict.generationMissing) return verdict
     if (now() > (verdict.building || verdict.generationMismatch ? hardDeadline : noticeDeadline)) return verdict

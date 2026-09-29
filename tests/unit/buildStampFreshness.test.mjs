@@ -129,6 +129,45 @@ test('content-identical rebuild stays fresh when its generation is already loade
   });
 });
 
+test('a stamp from another build mode does not block the loaded daemon', async () => {
+  const entries = [
+    { bundle: 'test/server', state: 'ok', stamp: { ...stampOf(1000), generation: 'other-bundle' } },
+    { bundle: 'app-test/server', state: 'ok', stamp: stampOf(1000) },
+  ];
+  const result = await ensureDaemonFresh({
+    getHealth: async () => ({ bundle: 'app-test/server', generation: 'same-bundle' }),
+    readStamps: () => entries,
+    wait: async () => { throw new Error('unrelated stamp blocked a healthy daemon'); },
+  });
+  assert.deepEqual(result, { stale: false });
+
+  const changed = evaluateStamps(
+    entries,
+    0,
+    process.cwd(),
+    'outdated-bundle',
+    'app-test/server',
+  );
+  assert.equal(changed.stale, true);
+  assert.equal(changed.bundle, 'app-test/server');
+  assert.deepEqual(
+    evaluateStamps(entries, 0, process.cwd(), 'same-bundle', 'missing/server'),
+    { unknown: true },
+  );
+});
+
+test('a daemon without a bundle ID cannot choose between build modes', async () => {
+  const result = await ensureDaemonFresh({
+    getHealth: async () => ({ generation: 'same-bundle' }),
+    readStamps: () => [
+      { bundle: 'test/server', state: 'ok', stamp: { ...stampOf(1000), generation: 'other-bundle' } },
+      { bundle: 'app-test/server', state: 'ok', stamp: stampOf(1000) },
+    ],
+    wait: async () => { throw new Error('must not wait on an unidentified build mode'); },
+  });
+  assert.equal(result.generationMissing, true);
+});
+
 test('run waits through compile-to-restart gap before declaring the daemon fresh', async () => {
   const entries = [{
     bundle: 'test/server',
