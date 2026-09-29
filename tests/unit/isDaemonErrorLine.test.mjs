@@ -3,9 +3,8 @@
 // Regression target: isDaemonErrorLine matched the bare substring 'Error'
 // against every daemon log line, so macOS's
 // 'Failed to start watcher for <path>: [Error: Error starting FSEvents
-// stream]' warning scored as a crash even though the daemon keeps running
-// and rebuilds normally. Under load this burned all three startup retries
-// and reported daemon_crashed for a daemon that was never down (fo-a3v67).
+// stream]' warning scored as a process crash. Watcher startup failure now
+// has a distinct verdict, so it must stay out of generic crash diagnostics.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
