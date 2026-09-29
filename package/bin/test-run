@@ -981,6 +981,26 @@ function logDaemonEvent(event, data = {}, { quiet = false } = {}) {
   }
 }
 
+// Flattened argv loses value boundaries; retain nothing after the first assignment.
+function redactProcessEntry(entry) {
+  return entry.replace(/([A-Za-z_][A-Za-z0-9_]*=)[\s\S]*/, '$1[redacted]')
+}
+
+function captureMeteorProcesses() {
+  const options = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000 }
+  const pids = execFileSync('pgrep', ['-f', 'meteor|rspack|mongod'], options)
+    .trim().split(/\s+/).filter(pid => /^\d+$/.test(pid)).slice(0, 20)
+  return pids.flatMap(pid => {
+    try {
+      // Query one PID at a time: newlines in argv must never become process boundaries.
+      const command = execFileSync('ps', ['-p', pid, '-ww', '-o', 'args='], options).trim()
+      return command ? [redactProcessEntry(`${pid} ${command}`)] : []
+    } catch {
+      return []
+    }
+  })
+}
+
 /**
  * Snapshot relevant system state at a phase boundary. Used to capture
  * what was happening around a daemon crash or timeout, so the failure
@@ -995,8 +1015,7 @@ function captureDiagnosticSnapshot(label, daemonPid) {
     snapshot.daemon_pid_alive = daemonPid ? isProcessRunning(daemonPid) : null
   } catch { snapshot.daemon_pid_alive = 'unknown' }
   try {
-    snapshot.meteor_procs = execSync(`pgrep -lf "meteor|rspack|mongod" 2>/dev/null || true`)
-      .toString().trim().split('\n').filter(Boolean).slice(0, 20)
+    snapshot.meteor_procs = captureMeteorProcesses()
   } catch { snapshot.meteor_procs = [] }
   try {
     const stat = fs.statSync(path.join(process.cwd(), '.meteor', 'local'))
@@ -3010,6 +3029,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  redactProcessEntry,
   main,
   acquireLock,
   createJsonProgressLogger,
