@@ -109,7 +109,8 @@ Health check endpoint.
 {
   "status": "ready",
   "suites": 62,
-  "running": false
+  "running": false,
+  "generation": "sha256-of-compiled-server-assets"
 }
 ```
 
@@ -177,7 +178,7 @@ The build answers through **build stamps**, written by `BuildStampPlugin` in the
 app's `rspack.config.js` on every watch rebuild, next to the bundle:
 
 - `<build-context>/<mode>/.build-stamp-server.json` — the last successful
-  compile: `builtAt`, `newestInputMtime`, `inputCount`, and the `inputs`
+  compile: `builtAt`, `generation`, `newestInputMtime`, `inputCount`, and the `inputs`
   themselves (`compilation.fileDependencies`, project files only).
 - `<build-context>/<mode>/.build-state-server.json` — what the compiler is doing
   now: `building`, `ok` or `failed`.
@@ -188,6 +189,17 @@ stale suite. So does a named target the build has never read — a brand-new spe
 is in no input list until the rebuild that adds it. The client-side stamp is
 ignored on purpose: the daemon runs server tests only, and Tailwind's content
 glob drags `docs/`, `.beads/` and `.claude/` into the client dependency graph.
+
+The server test bundle carries the same `generation` as the stamp. A run waits
+for `/test/health` to report that generation before dispatching tests. This
+covers the gap between compilation and Meteor's restart. The generation hashes
+compiled asset content, so a content-identical rebuild keeps the same value
+even though its `builtAt` advances.
+
+An older running daemon that cannot report a generation is restarted once so
+the new protocol can load. If health disappears during a normal Meteor restart,
+the client waits briefly for it to return; a daemon that remains unavailable
+is reported instead of being treated as a pending generation indefinitely.
 
 The wait is bounded by evidence rather than by a fixed budget. While the state
 file says `building`, the client waits for that compile (backstopped by

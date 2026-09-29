@@ -105,12 +105,8 @@ if (typeof global.describe === 'function') {
 // Daemon mode: allow multiple test runs without recreating the Mocha instance
 const isDaemonMode = !!process.env.TEST_DAEMON;
 
-// Rebuild timestamp. Meteor tears down and re-boots the server process on every
-// code change, so this module-scope constant is stamped fresh on each rebuild —
-// it is effectively "when did the currently-loaded bundle come to life". The
-// client (bin/test-run) compares a target file's mtime against this to detect a
-// wedged watcher serving a stale suite (a healthy daemon reports a builtAt newer
-// than any edited file within one rebuild cycle).
+// Process boot time, kept separate from the compiled bundle generation that
+// the test entry publishes when it loads.
 const BUILT_AT = Date.now();
 if (isDaemonMode) {
   // Use Mocha's method API to set options properly
@@ -670,6 +666,7 @@ function setupDaemonEndpoints() {
       suites: suiteCount,
       running: daemonTestsRunning,
       builtAt: BUILT_AT,
+      generation: globalThis.__focusterTestBuildGeneration || null,
     }));
   });
 

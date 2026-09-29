@@ -2055,7 +2055,7 @@ function classifyStampFreshness({
  * stale; `building` and `failed` describe what the compiler is doing about it,
  * which is what decides whether waiting is worth anything.
  */
-function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
+function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd(), loadedGeneration) {
   let worst = null
   let building = false
   let failed = null
@@ -2070,9 +2070,27 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
       appearedInput: appeared,
       targetMtime,
     })
+    if (!verdict.stale && (!entry.stamp.generation || !loadedGeneration)) {
+      worst ||= {
+        stale: true,
+        generationMissing: true,
+        bundle: entry.bundle,
+      }
+      continue
+    }
+    if (!verdict.stale && entry.stamp.generation !== loadedGeneration) {
+      worst ||= {
+        stale: true,
+        generationMismatch: true,
+        bundle: entry.bundle,
+        builtAt: entry.stamp.builtAt,
+      }
+      continue
+    }
     if (!verdict.stale) continue
     if (entry.state === 'failed') failed = entry.bundle
-    if (!worst || (verdict.mtimeMs || 0) > (worst.mtimeMs || 0)) {
+    if (!worst || worst.generationMismatch || worst.generationMissing ||
+      (verdict.mtimeMs || 0) > (worst.mtimeMs || 0)) {
       worst = { ...verdict, bundle: entry.bundle, builtAt: entry.stamp.builtAt }
     }
   }
@@ -2086,8 +2104,9 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
  * pass/fail for code that no longer exists on disk (observed: a test title
  * that had been renamed away still "ran").
  *
- * The build reports its own inputs (see BuildStampPlugin), so freshness is a
- * fact lookup: stat what the compiler read, compare against what it saw. The
+ * The build reports its own inputs and the server bundle generation (see
+ * BuildStampPlugin), so freshness is a fact lookup: stat what the compiler
+ * read, compare against what it saw, then match the loaded generation. The
  * old guard reconstructed the input set from a hand-written list of source
  * roots and extensions; any drift from rspack's real watch set gave a wrong
  * answer in both directions — false wedges that blocked pushes, and silent
@@ -2097,15 +2116,16 @@ function evaluateStamps(entries, targetMtime = 0, cwd = process.cwd()) {
  * compiler says `building` we wait for it, and when it says otherwise a stale
  * bundle means the watcher never noticed the edit.
  *
- * KNOWN GAP (fo-81ow2): the stamp says what was COMPILED, not what the daemon
- * is running. Meteor restarts after the compile, so a run dispatched in that
- * ~10s window reads fresh against the previous bundle. Gating on
- * `health.builtAt >= stamp.builtAt` was tried and reverted — a
- * content-identical rebuild advances the stamp without rewriting the bundle,
- * so Meteor never restarts and the check can never clear. Closing this needs a
- * build generation both sides can name, not a timestamp.
+ * A content-identical rebuild advances builtAt without restarting Meteor. The
+ * emitted bundle generation stays identical, so the loaded/stamped match
+ * remains fresh while a changed bundle waits for Meteor's restart.
  */
-async function ensureDaemonFresh() {
+async function ensureDaemonFresh({
+  getHealth = getHealthJson,
+  readStamps = readBuildStamps,
+  wait = () => new Promise((r) => setTimeout(r, 500)),
+  now = Date.now,
+} = {}) {
   // Nothing is running, so nothing stale can be served: the guard does not
   // apply and startup is about to build from current sources anyway.
   //
@@ -2114,7 +2134,8 @@ async function ensureDaemonFresh() {
   // tree reads as stale forever, and the run exits 2 BEFORE it would have
   // started the daemon that clears it. That bricks `test-run daemon stop &&
   // test-run`, which is the recovery path this very error message recommends.
-  if (!(await getHealthJson())) return { stale: false }
+  let health = await getHealth()
+  if (!health) return { stale: false }
 
   // filePattern may be a *partial* path — the documented `-f Foo.app-spec.ts`
   // and bare-positional workflows pass a filename the daemon resolves via suite
@@ -2135,15 +2156,28 @@ async function ensureDaemonFresh() {
     }
   }
 
-  const noticeDeadline = Date.now() + WATCH_NOTICE_MS
-  const hardDeadline = Date.now() + REBUILD_WAIT_MS
+  const noticeDeadline = now() + WATCH_NOTICE_MS
+  const hardDeadline = now() + REBUILD_WAIT_MS
+  let healthUnavailableSince = null
   for (;;) {
-    const entries = readBuildStamps()
+    if (!health) {
+      healthUnavailableSince ??= now()
+      if (now() > healthUnavailableSince + WATCH_NOTICE_MS) {
+        return { stale: true, daemonUnavailable: true }
+      }
+      await wait()
+      health = await getHealth()
+      continue
+    }
+    healthUnavailableSince = null
+    const entries = readStamps()
     if (!entries.length) return { unknown: true }
-    const verdict = evaluateStamps(entries, targetMtime)
+    const verdict = evaluateStamps(entries, targetMtime, process.cwd(), health?.generation)
     if (!verdict.stale) return { stale: false }
-    if (Date.now() > (verdict.building ? hardDeadline : noticeDeadline)) return verdict
-    await new Promise((r) => setTimeout(r, 500))
+    if (verdict.generationMissing) return verdict
+    if (now() > (verdict.building || verdict.generationMismatch ? hardDeadline : noticeDeadline)) return verdict
+    await wait()
+    health = await getHealth()
   }
 }
 
@@ -2225,6 +2259,15 @@ function describeStaleness(freshness, pattern) {
   if (freshness.failed) {
     return `Last build of ${freshness.failed} FAILED, so the daemon is still serving the bundle from before your edit.`
   }
+  if (freshness.daemonUnavailable) {
+    return `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(WATCH_NOTICE_MS / 1000)}s.`
+  }
+  if (freshness.generationMissing) {
+    return `${freshness.bundle} or the running daemon has no build generation. Restart the daemon to load the current build.`
+  }
+  if (freshness.generationMismatch) {
+    return `${freshness.bundle} compiled, but the daemon has not loaded that generation within ${Math.round(REBUILD_WAIT_MS / 1000)}s.`
+  }
   if (freshness.deleted) {
     return `${freshness.deleted} was deleted but is still compiled into ${freshness.bundle}. The daemon is serving a stale suite.`
   }
@@ -2257,6 +2300,8 @@ function shouldRestartDeadWatcher(freshness, alreadyAttempted) {
   if (alreadyAttempted) return false
   if (!freshness.stale) return false
   if (freshness.building) return false
+  if (freshness.generationMismatch) return false
+  if (freshness.daemonUnavailable) return false
   if (freshness.missing) return false
   return true
 }
@@ -2288,7 +2333,9 @@ async function restartDeadWatcherIfNeeded(freshness, {
   // so nothing will fix this on its own. Restart once and recheck. Always on
   // stderr, in both modes — see fo-23gyk, which needs this traceable rather
   // than silently self-healed.
-  const restartMessage = `⚠ Test daemon watcher appears DEAD (source changed but no rebuild ever started) — restarting the daemon once.`
+  const restartMessage = freshness.generationMissing
+    ? `⚠ Test daemon lacks build generation data — restarting the daemon once.`
+    : `⚠ Test daemon watcher appears DEAD (source changed but no rebuild ever started) — restarting the daemon once.`
   console.error(jsonMode ? restartMessage : `\n${colors.yellow}${restartMessage}${colors.reset}`)
   watcherRestarted = true
 
@@ -3036,6 +3083,7 @@ module.exports = {
   hashDirTree,
   classifyStampFreshness,
   evaluateStamps,
+  ensureDaemonFresh,
   describeStaleness,
   shouldRestartDeadWatcher,
   restartDeadWatcherIfNeeded,

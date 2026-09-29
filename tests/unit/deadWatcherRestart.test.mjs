@@ -33,6 +33,27 @@ test('rebuild in flight/wedged (building: true): no restart, different failure',
   );
 });
 
+test('compiled generation awaiting Meteor restart is not a dead watcher', () => {
+  assert.equal(
+    shouldRestartDeadWatcher({ stale: true, generationMismatch: true, building: false }, false),
+    false,
+  );
+});
+
+test('missing generation data earns one restart to load the new protocol', () => {
+  assert.equal(
+    shouldRestartDeadWatcher({ stale: true, generationMissing: true }, false),
+    true,
+  );
+});
+
+test('an unavailable daemon is reported without a restart loop', () => {
+  assert.equal(
+    shouldRestartDeadWatcher({ stale: true, daemonUnavailable: true }, false),
+    false,
+  );
+});
+
 test('missing target file: no restart, user error', () => {
   assert.equal(
     shouldRestartDeadWatcher({ stale: true, building: false, missing: true }, false),

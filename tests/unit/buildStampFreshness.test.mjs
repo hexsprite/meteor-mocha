@@ -20,6 +20,7 @@ const require = createRequire(import.meta.url);
 const {
   classifyStampFreshness,
   evaluateStamps,
+  ensureDaemonFresh,
   hashDirTree,
   readBuildStamps,
   scanStampInputs,
@@ -28,6 +29,7 @@ const {
 
 const stampOf = (newestInputMtime, inputs = [], absent = []) => ({
   builtAt: newestInputMtime + 1000,
+  generation: 'same-bundle',
   newestInputMtime,
   inputCount: inputs.length,
   inputs,
@@ -87,26 +89,134 @@ test('evaluateStamps: one stale bundle makes the whole daemon stale', () => {
     { bundle: 'test/server', state: 'ok', stamp: stampOf(9000) },
     { bundle: 'test/client', state: 'ok', stamp: stampOf(1000) },
   ];
-  const verdict = evaluateStamps(entries, 5000);
+  const verdict = evaluateStamps(entries, 5000, process.cwd(), 'same-bundle');
   assert.equal(verdict.stale, true);
   assert.equal(verdict.bundle, 'test/client');
 });
 
 test('evaluateStamps: reports building so the caller waits instead of crying wedged', () => {
   const entries = [{ bundle: 'test/server', state: 'building', stamp: stampOf(1000) }];
-  const verdict = evaluateStamps(entries, 5000);
+  const verdict = evaluateStamps(entries, 5000, process.cwd(), 'same-bundle');
   assert.equal(verdict.stale, true);
   assert.equal(verdict.building, true);
 });
 
 test('evaluateStamps: a failed compile is named, not silently waited on', () => {
   const entries = [{ bundle: 'test/server', state: 'failed', stamp: stampOf(1000) }];
-  assert.equal(evaluateStamps(entries, 5000).failed, 'test/server');
+  assert.equal(evaluateStamps(entries, 5000, process.cwd(), 'same-bundle').failed, 'test/server');
 });
 
 test('evaluateStamps: fresh bundles report no build state to act on', () => {
   const entries = [{ bundle: 'test/server', state: 'ok', stamp: stampOf(9000) }];
-  assert.equal(evaluateStamps(entries, 5000).stale, false);
+  assert.equal(evaluateStamps(entries, 5000, process.cwd(), 'same-bundle').stale, false);
+});
+
+test('compiled generation is stale until the daemon loads that bundle', () => {
+  const stamp = { ...stampOf(1000), generation: 'new-bundle' };
+  const entries = [{ bundle: 'test/server', state: 'ok', stamp }];
+  const verdict = evaluateStamps(entries, 0, process.cwd(), 'old-bundle');
+  assert.equal(verdict.stale, true);
+  assert.equal(verdict.bundle, 'test/server');
+});
+
+test('content-identical rebuild stays fresh when its generation is already loaded', () => {
+  const stamp = { ...stampOf(1000), builtAt: 9000, generation: 'same-bundle' };
+  const entries = [{ bundle: 'test/server', state: 'ok', stamp }];
+  assert.deepEqual(evaluateStamps(entries, 0, process.cwd(), 'same-bundle'), {
+    stale: false,
+    building: false,
+    failed: null,
+  });
+});
+
+test('run waits through compile-to-restart gap before declaring the daemon fresh', async () => {
+  const entries = [{
+    bundle: 'test/server',
+    state: 'ok',
+    stamp: { ...stampOf(1000), generation: 'new-bundle' },
+  }];
+  let healthReads = 0;
+  let waits = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: async () => ({ generation: ++healthReads === 1 ? 'old-bundle' : 'new-bundle' }),
+    readStamps: () => entries,
+    wait: async () => { waits++; },
+  });
+  assert.deepEqual(result, { stale: false });
+  assert.equal(waits, 1);
+  assert.equal(healthReads, 2);
+});
+
+test('run does not wait for a content-identical rebuild', async () => {
+  const entries = [{
+    bundle: 'test/server',
+    state: 'ok',
+    stamp: { ...stampOf(1000), builtAt: 9000 },
+  }];
+  let waits = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: async () => ({ generation: 'same-bundle' }),
+    readStamps: () => entries,
+    wait: async () => { waits++; },
+  });
+  assert.deepEqual(result, { stale: false });
+  assert.equal(waits, 0);
+});
+
+test('a stamp without a generation cannot be declared fresh', () => {
+  const { generation, ...stamp } = stampOf(1000);
+  assert.ok(generation);
+  const entries = [{ bundle: 'test/server', state: 'ok', stamp }];
+  assert.equal(evaluateStamps(entries, 0, process.cwd(), 'same-bundle').stale, true);
+});
+
+test('an older daemon without generation data does not wait for a rebuild', async () => {
+  const { generation, ...stamp } = stampOf(1000);
+  assert.ok(generation);
+  const result = await ensureDaemonFresh({
+    getHealth: async () => ({ generation: null }),
+    readStamps: () => [{ bundle: 'test/server', state: 'ok', stamp }],
+    wait: async () => { throw new Error('must not wait on missing generation'); },
+  });
+  assert.equal(result.generationMissing, true);
+});
+
+test('a daemon that disappears during restart reports unavailable promptly', async () => {
+  let time = 0;
+  let healthReads = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: async () => (++healthReads === 1 ? { generation: 'old-bundle' } : null),
+    readStamps: () => [{
+      bundle: 'test/server',
+      state: 'ok',
+      stamp: { ...stampOf(1000), generation: 'new-bundle' },
+    }],
+    wait: async () => {
+      time += 1000;
+      if (time > 10000) throw new Error('waited too long for unavailable daemon');
+    },
+    now: () => time,
+  });
+  assert.equal(result.daemonUnavailable, true);
+});
+
+test('a brief health gap during restart still waits for the loaded generation', async () => {
+  const generations = ['old-bundle', null, 'new-bundle'];
+  let waits = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: async () => {
+      const generation = generations.shift();
+      return generation ? { generation } : null;
+    },
+    readStamps: () => [{
+      bundle: 'test/server',
+      state: 'ok',
+      stamp: { ...stampOf(1000), generation: 'new-bundle' },
+    }],
+    wait: async () => { waits++; },
+  });
+  assert.deepEqual(result, { stale: false });
+  assert.equal(waits, 2);
 });
 
 test('describeStaleness tells a failed build apart from a wedged watcher', () => {
