@@ -12,11 +12,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
-// lockFile binds to process.cwd() at module load, so chdir into an isolated
-// tmpdir BEFORE requiring the bin. Safe here: node --test runs each file in
-// its own process.
+// lockFile binds to PROJECT_ROOT at module load (fo-zj5oj: resolved from the
+// script's own location, not process.cwd(), so chdir can no longer redirect
+// it). Point it at an isolated tmpdir via the test-only TEST_RUN_PROJECT_ROOT
+// override instead, set BEFORE requiring the bin. Safe here: node --test
+// runs each file in its own process.
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'test-run-lock-'));
-process.chdir(tmp);
+process.env.TEST_RUN_PROJECT_ROOT = tmp;
 
 const require = createRequire(import.meta.url);
 const { acquireLock } = require('../../package/bin/test-run');
