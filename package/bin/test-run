@@ -1012,7 +1012,7 @@ function logDaemonEvent(event, data = {}, { quiet = false } = {}) {
 // Flattened argv loses value boundaries; flags, JSON credentials and assignments
 // discard the remaining tail rather than guessing where a secret value ends.
 function redactProcessEntry(entry) {
-  const credentialName = /token|pass(?:word|wd)|secret|credential|authorization|api[_-]?key|private[_-]?key/i
+  const credentialName = /(?:token|pass(?:word|wd|phrase)|secret|credentials?|authorization|api[_-]?key|private[_-]?key|secret[_-]?(?:access[_-]?)?key)$/i
   let redacted = entry.replace(/(mongodb(?:\+srv)?:\\*\/\\*\/[^\s/:@]+:)[^@]*@/gi, '$1[redacted]@')
   for (const match of redacted.matchAll(/--([\w"'\\-]+)\s+/g)) {
     const name = match[1].replace(/["'\\]/g, '')

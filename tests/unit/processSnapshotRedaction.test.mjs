@@ -32,6 +32,7 @@ const controls = [
   '117 /usr/bin/mongod --dbpath /worktree/.meteor/local/db',
   '118 /usr/bin/node /worktree/rspack/main.js --config \'{"mode":"development","port":3000}\'',
   '119 /usr/bin/mongosh mongodb://host/db',
+  '126 /usr/bin/node /worktree/meteor/main.js --token-count 512 --config \'{"tokenCount":512,"passwordPolicy":"strong","port":3000}\'',
 ];
 
 for (const entry of entries) {
