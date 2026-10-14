@@ -1009,9 +1009,27 @@ function logDaemonEvent(event, data = {}, { quiet = false } = {}) {
   }
 }
 
-// Flattened argv loses value boundaries; retain nothing after the first assignment.
+// Flattened argv loses value boundaries; flags, JSON credentials and assignments
+// discard the remaining tail rather than guessing where a secret value ends.
 function redactProcessEntry(entry) {
-  return entry.replace(/([A-Za-z_][A-Za-z0-9_]*=)[\s\S]*/, '$1[redacted]')
+  const credentialName = /token|pass(?:word|wd)|secret|credential|authorization|api[_-]?key|private[_-]?key/i
+  let redacted = entry.replace(/(mongodb(?:\+srv)?:\\*\/\\*\/[^\s/:@]+:)[^@]*@/gi, '$1[redacted]@')
+  for (const match of redacted.matchAll(/--([\w"'\\-]+)\s+/g)) {
+    const name = match[1].replace(/["'\\]/g, '')
+    if (credentialName.test(name)) {
+      redacted = redacted.slice(0, match.index + match[0].length) + '[redacted]'
+      break
+    }
+  }
+  for (const match of redacted.matchAll(/\\?["']([^"']+?)\\?["']\s*:\s*/g)) {
+    const name = match[1].replace(/\\u([\da-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    if (credentialName.test(name)) {
+      redacted = redacted.slice(0, match.index + match[0].length) + '[redacted]'
+      break
+    }
+  }
+  return redacted
+    .replace(/([A-Za-z_][A-Za-z0-9_]*=)[\s\S]*/, '$1[redacted]')
 }
 
 function captureMeteorProcesses() {
