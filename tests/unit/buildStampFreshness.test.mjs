@@ -220,6 +220,85 @@ test('an older daemon without generation data does not wait for a rebuild', asyn
   assert.equal(result.generationMissing, true);
 });
 
+// fo-q6ne4: a rebuild restarts Meteor's server, and /test/health is gone for the
+// whole restart. The 8 s watch notice is for a watcher that never reacts, not for
+// a restart in progress, so a daemon whose process is alive gets the longer
+// restart window; only a vanished process reports unavailable promptly.
+/** A daemon that answered once with the old bundle, then follows `later`. */
+const answersOnce = (later) => {
+  let reads = 0;
+  return async () => (++reads === 1 ? { generation: 'old-bundle' } : later());
+};
+
+const restartingEntry = [{
+  bundle: 'test/server',
+  state: 'ok',
+  stamp: { ...stampOf(1000), generation: 'new-bundle' },
+}];
+
+test('a live daemon whose health answers late in a restart is not reported unavailable', async () => {
+  let time = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: answersOnce(() => (time < 25000 ? null : { generation: 'new-bundle' })),
+    readStamps: () => restartingEntry,
+    isDaemonProcessAlive: () => true,
+    wait: async () => { time += 1000; },
+    now: () => time,
+  });
+  assert.deepEqual(result, { stale: false });
+});
+
+test('a late answer from a restart that has not loaded the new bundle is still stale', async () => {
+  let time = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: answersOnce(() => (time < 25000 ? null : { generation: 'old-bundle' })),
+    readStamps: () => restartingEntry,
+    isDaemonProcessAlive: () => true,
+    wait: async () => { time += 1000; if (time > 400000) throw new Error('unbounded'); },
+    now: () => time,
+  });
+  assert.equal(result.stale, true);
+  assert.equal(result.generationMismatch, true);
+});
+
+test('a live daemon that never answers is reported unavailable once the restart window ends', async () => {
+  let time = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: answersOnce(() => null),
+    readStamps: () => restartingEntry,
+    isDaemonProcessAlive: () => true,
+    wait: async () => { time += 1000; if (time > 400000) throw new Error('unbounded'); },
+    now: () => time,
+  });
+  assert.equal(result.daemonUnavailable, true);
+  assert.equal(result.processAlive, true);
+  assert.ok(time >= 100000, `gave up after only ${time} ms`);
+});
+
+test('a daemon whose process is gone is reported unavailable within the watch notice', async () => {
+  let time = 0;
+  const result = await ensureDaemonFresh({
+    getHealth: answersOnce(() => null),
+    readStamps: () => restartingEntry,
+    isDaemonProcessAlive: () => false,
+    wait: async () => { time += 1000; if (time > 10000) throw new Error('waited too long for a dead daemon'); },
+    now: () => time,
+  });
+  assert.equal(result.daemonUnavailable, true);
+  assert.equal(result.processAlive, false);
+});
+
+test('the unavailable message says whether the process is still running', () => {
+  assert.match(
+    describeStaleness({ daemonUnavailable: true, processAlive: true }, ''),
+    /still running/,
+  );
+  assert.match(
+    describeStaleness({ daemonUnavailable: true, processAlive: false }, ''),
+    /exited/,
+  );
+});
+
 test('a daemon that disappears during restart reports unavailable promptly', async () => {
   let time = 0;
   let healthReads = 0;
@@ -230,6 +309,7 @@ test('a daemon that disappears during restart reports unavailable promptly', asy
       state: 'ok',
       stamp: { ...stampOf(1000), generation: 'new-bundle' },
     }],
+    isDaemonProcessAlive: () => false,
     wait: async () => {
       time += 1000;
       if (time > 10000) throw new Error('waited too long for unavailable daemon');

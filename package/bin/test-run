@@ -1929,6 +1929,10 @@ const WATCH_NOTICE_MS = +(process.env.TEST_DAEMON_WATCH_NOTICE_MS || 8000)
 // Backstop for a rebuild that IS running but never finishes. Only a hung
 // compile reaches this.
 const REBUILD_WAIT_MS = +(process.env.TEST_DAEMON_REBUILD_WAIT_MS || 300000)
+// A rebuild restarts Meteor's server, and /test/health is gone for the whole
+// restart. While the daemon's process is alive that gap is a restart in
+// progress, not a wedge, so it gets this window instead of the watch notice.
+const RESTART_WAIT_MS = +(process.env.TEST_DAEMON_RESTART_WAIT_MS || 120000)
 // Where the Meteor/rspack integration emits its bundles. The daemon runs with
 // RSPACK_BUILD_CONTEXT=_build-daemon; that env doesn't reach this client, so
 // default to the same value and allow an override for other setups.
@@ -2193,6 +2197,11 @@ async function ensureDaemonFresh({
   readStamps = readBuildStamps,
   wait = () => new Promise((r) => setTimeout(r, 500)),
   now = Date.now,
+  isDaemonProcessAlive = () => {
+    const pid = readPid()
+    return Boolean(pid) && isProcessRunning(pid)
+  },
+  restartWaitMs = RESTART_WAIT_MS,
 } = {}) {
   // Nothing is running, so nothing stale can be served: the guard does not
   // apply and startup is about to build from current sources anyway.
@@ -2230,8 +2239,12 @@ async function ensureDaemonFresh({
   for (;;) {
     if (!health) {
       healthUnavailableSince ??= now()
-      if (now() > healthUnavailableSince + WATCH_NOTICE_MS) {
-        return { stale: true, daemonUnavailable: true }
+      // A live process is mid-restart and gets the restart window; a process
+      // that is gone cannot recover, so that is reported within the notice.
+      const processAlive = isDaemonProcessAlive()
+      const budget = processAlive ? restartWaitMs : WATCH_NOTICE_MS
+      if (now() > healthUnavailableSince + budget) {
+        return { stale: true, daemonUnavailable: true, processAlive }
       }
       await wait()
       health = await getHealth()
@@ -2332,7 +2345,9 @@ function describeStaleness(freshness, pattern) {
     return `Last build of ${freshness.failed} FAILED, so the daemon is still serving the bundle from before your edit.`
   }
   if (freshness.daemonUnavailable) {
-    return `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(WATCH_NOTICE_MS / 1000)}s.`
+    return freshness.processAlive
+      ? `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(RESTART_WAIT_MS / 1000)}s, though its process is still running. Check ./scripts/test-run daemon logs -t before restarting it.`
+      : `The daemon stopped answering /test/health during a rebuild and its process has exited.`
   }
   if (freshness.generationMissing) {
     return `${freshness.bundle} or the running daemon has no build generation. Restart the daemon to load the current build.`
