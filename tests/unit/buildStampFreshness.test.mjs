@@ -220,7 +220,7 @@ test('an older daemon without generation data does not wait for a rebuild', asyn
   assert.equal(result.generationMissing, true);
 });
 
-test('a daemon that disappears during restart reports unavailable promptly', async () => {
+test('a daemon that disappears during restart reports unavailable at the rebuild deadline', async () => {
   let time = 0;
   let healthReads = 0;
   const result = await ensureDaemonFresh({
@@ -232,11 +232,12 @@ test('a daemon that disappears during restart reports unavailable promptly', asy
     }],
     wait: async () => {
       time += 1000;
-      if (time > 10000) throw new Error('waited too long for unavailable daemon');
+      if (time > 301000) throw new Error('waited too long for unavailable daemon');
     },
     now: () => time,
   });
   assert.equal(result.daemonUnavailable, true);
+  assert.equal(time, 300000);
 });
 
 test('a brief health gap during restart still waits for the loaded generation', async () => {
