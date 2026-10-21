@@ -1944,8 +1944,8 @@ Examples:
 // reacting. A watcher that never reacts is wedged, and now we can say so in
 // seconds instead of guessing for two minutes.
 const WATCH_NOTICE_MS = +(process.env.TEST_DAEMON_WATCH_NOTICE_MS || 8000)
-// Backstop for a rebuild that IS running but never finishes. Only a hung
-// compile reaches this.
+// Backstop for compilation, generation loading, and health recovery during
+// a rebuild. A brief restart outage must not use the watcher-notice budget.
 const REBUILD_WAIT_MS = +(process.env.TEST_DAEMON_REBUILD_WAIT_MS || 300000)
 // Where the Meteor/rspack integration emits its bundles. The daemon runs with
 // RSPACK_BUILD_CONTEXT=_build-daemon; that env doesn't reach this client, so
@@ -2244,18 +2244,15 @@ async function ensureDaemonFresh({
 
   const noticeDeadline = now() + WATCH_NOTICE_MS
   const hardDeadline = now() + REBUILD_WAIT_MS
-  let healthUnavailableSince = null
   for (;;) {
     if (!health) {
-      healthUnavailableSince ??= now()
-      if (now() > healthUnavailableSince + WATCH_NOTICE_MS) {
+      if (now() >= hardDeadline) {
         return { stale: true, daemonUnavailable: true }
       }
       await wait()
       health = await getHealth()
       continue
     }
-    healthUnavailableSince = null
     const entries = readStamps()
     if (!entries.length) return { unknown: true }
     if (!health.bundle && entries.length > 1) {
@@ -2350,7 +2347,7 @@ function describeStaleness(freshness, pattern) {
     return `Last build of ${freshness.failed} FAILED, so the daemon is still serving the bundle from before your edit.`
   }
   if (freshness.daemonUnavailable) {
-    return `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(WATCH_NOTICE_MS / 1000)}s.`
+    return `The daemon stopped answering /test/health during a rebuild and did not recover before the ${Math.round(REBUILD_WAIT_MS / 1000)}s rebuild deadline.`
   }
   if (freshness.generationMissing) {
     return `${freshness.bundle} or the running daemon has no build generation. Restart the daemon to load the current build.`

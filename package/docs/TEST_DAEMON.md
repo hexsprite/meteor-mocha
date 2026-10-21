@@ -201,12 +201,13 @@ even though its `builtAt` advances.
 An older running daemon that cannot report a generation, or cannot identify its
 build mode when multiple stamps exist, is restarted once so the new protocol can
 load. If health disappears during a normal Meteor restart,
-the client waits briefly for it to return; a daemon that remains unavailable
-is reported instead of being treated as a pending generation indefinitely.
+the client waits for it to return within the same rebuild deadline. A daemon
+that remains unavailable at that deadline fails with a restart hint.
 
 The wait is bounded by evidence rather than by a fixed budget. While the state
 file says `building`, the client waits for that compile (backstopped by
-`TEST_DAEMON_REBUILD_WAIT_MS`, which only a hung compile reaches). When it says
+`TEST_DAEMON_REBUILD_WAIT_MS`, also shared by generation loading and health
+recovery). When it says
 otherwise and the bundle is still behind, the watcher never noticed the edit —
 reported after `TEST_DAEMON_WATCH_NOTICE_MS`, so a wedge surfaces in seconds
 instead of minutes.
