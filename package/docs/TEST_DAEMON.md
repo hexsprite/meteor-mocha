@@ -205,11 +205,13 @@ it to return: up to `TEST_DAEMON_RESTART_WAIT_MS` (default 120 s) while the
 daemon's process is alive, since a restart can outlast the watch notice, and
 only `TEST_DAEMON_WATCH_NOTICE_MS` once the process has exited. A daemon that
 remains unavailable is reported, with whether its process is still running,
-instead of being treated as a pending generation indefinitely.
+instead of being treated as a pending generation indefinitely. Health recovery
+is also capped by the shared rebuild deadline.
 
 The wait is bounded by evidence rather than by a fixed budget. While the state
 file says `building`, the client waits for that compile (backstopped by
-`TEST_DAEMON_REBUILD_WAIT_MS`, which only a hung compile reaches). When it says
+`TEST_DAEMON_REBUILD_WAIT_MS`, also shared by generation loading and health
+recovery). When it says
 otherwise and the bundle is still behind, the watcher never noticed the edit —
 reported after `TEST_DAEMON_WATCH_NOTICE_MS`, so a wedge surfaces in seconds
 instead of minutes.

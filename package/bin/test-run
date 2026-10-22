@@ -1926,8 +1926,8 @@ Examples:
 // reacting. A watcher that never reacts is wedged, and now we can say so in
 // seconds instead of guessing for two minutes.
 const WATCH_NOTICE_MS = +(process.env.TEST_DAEMON_WATCH_NOTICE_MS || 8000)
-// Backstop for a rebuild that IS running but never finishes. Only a hung
-// compile reaches this.
+// Backstop for compilation, generation loading, and health recovery during
+// a rebuild. A brief restart outage must not use the watcher-notice budget.
 const REBUILD_WAIT_MS = +(process.env.TEST_DAEMON_REBUILD_WAIT_MS || 300000)
 // A rebuild restarts Meteor's server, and /test/health is gone for the whole
 // restart. While the daemon's process is alive that gap is a restart in
@@ -2243,7 +2243,7 @@ async function ensureDaemonFresh({
       // that is gone cannot recover, so that is reported within the notice.
       const processAlive = isDaemonProcessAlive()
       const budget = processAlive ? restartWaitMs : WATCH_NOTICE_MS
-      if (now() > healthUnavailableSince + budget) {
+      if (now() >= hardDeadline || now() > healthUnavailableSince + budget) {
         return { stale: true, daemonUnavailable: true, processAlive }
       }
       await wait()
@@ -2346,7 +2346,7 @@ function describeStaleness(freshness, pattern) {
   }
   if (freshness.daemonUnavailable) {
     return freshness.processAlive
-      ? `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(RESTART_WAIT_MS / 1000)}s, though its process is still running. Check ./scripts/test-run daemon logs -t before restarting it.`
+      ? `The daemon stopped answering /test/health during a rebuild and did not recover within ${Math.round(RESTART_WAIT_MS / 1000)}s or before the ${Math.round(REBUILD_WAIT_MS / 1000)}s rebuild deadline, though its process is still running. Check ./scripts/test-run daemon logs -t before restarting it.`
       : `The daemon stopped answering /test/health during a rebuild and its process has exited.`
   }
   if (freshness.generationMissing) {
