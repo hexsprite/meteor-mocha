@@ -200,9 +200,13 @@ even though its `builtAt` advances.
 
 An older running daemon that cannot report a generation, or cannot identify its
 build mode when multiple stamps exist, is restarted once so the new protocol can
-load. If health disappears during a normal Meteor restart,
-the client waits for it to return within the same rebuild deadline. A daemon
-that remains unavailable at that deadline fails with a restart hint.
+load. If health disappears during a normal Meteor restart, the client waits for
+it to return: up to `TEST_DAEMON_RESTART_WAIT_MS` (default 120 s) while the
+daemon's process is alive, since a restart can outlast the watch notice, and
+only `TEST_DAEMON_WATCH_NOTICE_MS` once the process has exited. A daemon that
+remains unavailable is reported, with whether its process is still running,
+instead of being treated as a pending generation indefinitely. Health recovery
+is also capped by the shared rebuild deadline.
 
 The wait is bounded by evidence rather than by a fixed budget. While the state
 file says `building`, the client waits for that compile (backstopped by
